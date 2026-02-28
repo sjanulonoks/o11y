@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.01
+version: 0.02
 description: >
   Use when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying observability backends (Prometheus/Mimir,
@@ -53,6 +53,214 @@ Route:
 - Vague symptom ("things are slow") → novice path: explain each step briefly
 - Exact service + time + symptom → expert path: skip explanations, minimise
   narration, go directly to evidence
+
+---
+
+## Step −0.5: Query Planning (First Principles Thinking)
+
+**MANDATORY before ANY query to ANY backend.**
+
+Think from first principles: What data structure directly answers the user's question?
+
+### Universal Intent Classification
+
+Classify user's question into ONE intent category:
+
+| Intent Category | User Keywords | What They Want |
+|-----------------|---------------|----------------|
+| **COUNT/TOTAL** | "how many", "total", "number of", "count" | Exact integer counts over entire window |
+| **RATE** | "per second", "TPS", "QPS", "throughput" | Events per time unit |
+| **DISTRIBUTION** | "p50", "p95", "p99", "percentile", "median" | Quantile values |
+| **CENTRAL TENDENCY** | "average", "mean", "typical" | Arithmetic mean |
+| **RANGE** | "min", "max", "highest", "lowest" | Extreme values |
+| **EXISTENCE** | "is X up", "does X exist", "available" | Boolean/status check |
+| **COMPARISON** | "difference", "delta", "changed", "before vs after" | Two queries with comparison |
+| **TREND** | "over time", "per minute", "trend", "pattern" | Time-series data |
+
+### The Iron Rule: Actual Data > Calculated Estimates
+
+```
+🔴 FORBIDDEN: Deriving answers through calculation when direct query exists
+
+❌ BAD Pattern:
+1. Query for rate (e.g., 1.5 requests/sec)
+2. Multiply by time window (e.g., 1.5 × 900 = ~1,350)
+3. Present estimate as answer
+
+✅ GOOD Pattern:
+1. Query directly for what user asked (e.g., total count)
+2. Return exact value from backend (e.g., 742)
+3. Present actual data
+
+**Why:** Calculations introduce error, assumptions, and speculation.
+Backends store raw data. Query it directly.
+```
+
+### Backend-Specific Query Planning
+
+After classifying intent, map to backend-specific approach:
+
+#### Prometheus/Mimir Query Planning
+
+| User Intent | Direct Query Function | NOT This |
+|-------------|----------------------|----------|
+| COUNT/TOTAL | `sum(increase(metric[15m]))` or `count_over_time()` | ❌ `rate() × time` |
+| RATE | `rate(metric[5m])` | ❌ `increase() / time` |
+| DISTRIBUTION | `histogram_quantile(0.95, metric_bucket)` | ❌ Multiple range queries averaged |
+| CENTRAL TENDENCY | `avg_over_time(metric[15m])` | ❌ Sum / count manually |
+| EXISTENCE | `up{job="X"}` | ❌ Query metrics, assume if 0 |
+
+#### Loki Query Planning
+
+| User Intent | Direct Query Function | NOT This |
+|-------------|----------------------|----------|
+| COUNT/TOTAL | `count_over_time({selector}[15m])` | ❌ `rate() × time` |
+| RATE | `rate({selector}[5m])` | ❌ Count / time manually |
+| EXISTENCE | `{selector}` with limit=1 | ❌ count_over_time() when you just need boolean |
+| PATTERN | `query_loki_patterns()` | ❌ Parse logs manually for patterns |
+| VOLUME CHECK | `query_loki_stats()` | ❌ Query logs with high limit to estimate |
+
+#### Tempo (TraceQL) Query Planning
+
+| User Intent | Direct Query Function | NOT This |
+|-------------|----------------------|----------|
+| COUNT/TOTAL | `count_over_time()` with Instant, step=window | ❌ `rate() × time` |
+| RATE | `rate()` | ❌ `count_over_time() / time` |
+| DISTRIBUTION | `quantile_over_time(duration, 0.95)` | ❌ Multiple queries + manual percentile |
+| CENTRAL TENDENCY | `avg_over_time(duration)` | ❌ Sum / count manually |
+| EXISTENCE | `{ service="X" }` limit=1 | ❌ count when you just need boolean |
+
+### Instant vs Range Query Decision (Applies to All Backends)
+
+| User Says | Query Type | Returns | Example |
+|-----------|------------|---------|---------|
+| "What is...", "How many...", "Total..." | **Instant** | Single value | "What is total request count?" |
+| "Show trend...", "Over time...", "Per minute..." | **Range** | Time-series | "Show request rate per minute" |
+| "Compare X vs Y" | **Instant** × 2 | Two values | "Requests in EU vs US" |
+
+### Query Planning Output Template (MANDATORY)
+
+Before EVERY analytical query, output:
+
+```
+## QUERY PLAN
+Backend: [Prometheus/Loki/Tempo]
+User intent: [COUNT/RATE/DISTRIBUTION/etc]
+User's exact words: "[quote their question]"
+Data structure needed: [single value / time-series / comparison]
+Query type: [Instant / Range]
+Function/aggregation: [specific function name]
+Rationale: User asked for [X], which is directly provided by [function]
+
+Anti-pattern check: ❌ NOT using [wrong approach] because [reason]
+```
+
+### Practical Examples
+
+#### Example 1: Total Count Query (Tempo)
+
+**User asks:** "How many total requests did the `checkout-service` handle in the last 15 minutes?"
+
+```
+## QUERY PLAN
+Backend: Tempo (TraceQL)
+User intent: COUNT/TOTAL
+User's exact words: "How many total requests"
+Data structure needed: single value (sum across all series)
+Query type: Instant
+Function/aggregation: count_over_time() with step=15m
+Rationale: User asked for total count over 15min window, which is directly 
+provided by count_over_time() with Instant query type and step matching window
+
+Anti-pattern check: ❌ NOT using rate() × 900s because that produces an estimate
+based on sampling. count_over_time() gives exact count from raw span data.
+```
+
+**Query:** `{ resource.service.name="checkout-service" } | count_over_time() by(resource.service.name)`  
+**Query type:** Instant, step=15m
+
+---
+
+#### Example 2: Rate Query (Prometheus)
+
+**User asks:** "What's the current error rate per second for the API?"
+
+```
+## QUERY PLAN
+Backend: Prometheus
+User intent: RATE
+User's exact words: "error rate per second"
+Data structure needed: single value (rate)
+Query type: Instant
+Function/aggregation: rate() over 5m lookback
+Rationale: User asked for rate (events/second), which is directly provided by
+rate() function. No need to calculate from totals.
+
+Anti-pattern check: ❌ NOT using increase() / time because rate() is the 
+native function that accounts for counter resets and provides per-second rate
+```
+
+**Query:** `sum(rate(http_requests_total{status=~"5.."}[5m]))`  
+**Query type:** Instant
+
+---
+
+#### Example 3: Trend Over Time (Loki)
+
+**User asks:** "Show me the error log count per minute for the last hour"
+
+```
+## QUERY PLAN
+Backend: Loki
+User intent: TREND
+User's exact words: "per minute for the last hour"
+Data structure needed: time-series (multiple data points)
+Query type: Range
+Function/aggregation: rate() to get per-second, multiply by 60 for per-minute
+Rationale: User asked for trend "over time" with per-minute resolution. Range 
+query returns time-series. rate() gives per-second baseline.
+
+Anti-pattern check: ❌ NOT using count_over_time() because user wants trend 
+visualization, not a single total. Range query with rate() produces time-series.
+```
+
+**Query:** `sum(rate({app="api"} |= "error"[5m]) * 60)`  
+**Query type:** Range, start=now-1h, end=now
+
+---
+
+#### Example 4: Percentile (Tempo)
+
+**User asks:** "What's the p95 latency for the payment service?"
+
+```
+## QUERY PLAN
+Backend: Tempo (TraceQL)
+User intent: DISTRIBUTION
+User's exact words: "p95 latency"
+Data structure needed: single value (percentile)
+Query type: Instant
+Function/aggregation: quantile_over_time(duration, 0.95)
+Rationale: User asked for 95th percentile, which is directly calculated by 
+quantile_over_time() from duration field across all matching spans
+
+Anti-pattern check: ❌ NOT fetching all durations and calculating percentile 
+manually. Backend has native histogram/quantile functions for distributions.
+```
+
+**Query:** `{ resource.service.name="payment-service" } | quantile_over_time(duration, 0.95)`  
+**Query type:** Instant, step=15m
+
+---
+
+### First Principles Checklist
+
+Before constructing query:
+- [ ] User intent classified (COUNT/RATE/DISTRIBUTION/etc)
+- [ ] Direct query function identified (not derived calculation)
+- [ ] Query type matches intent (Instant for values, Range for trends)
+- [ ] Anti-pattern explicitly checked (not calculating what can be queried)
+- [ ] Query plan documented above
 
 ---
 
@@ -252,6 +460,8 @@ Output + store in Session State:
 
 State sequence before querying. Do not skip this.
 
+**CRITICAL:** Before querying each backend, complete Step −0.5 (Query Planning) to classify intent and select appropriate query approach.
+
 ---
 
 ### Step 4: Query Primary Backend
@@ -269,30 +479,33 @@ strictly sequential.
     2. list_prometheus_label_names → confirm label keys exist
     3. list_prometheus_label_values(labelName="job") → find actual service value
        [skip if service already in Session State]
-    4. Apply PromQL checklist (Appendix A) — rewrite non-compliant patterns
-    5. Start with: up{job="<value>"} to confirm service exists
-    6. query_prometheus(expr=..., startTime=..., endTime=...)
-    7. Analyze: trend, spike, anomaly
+    4. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
+    5. Apply PromQL checklist (Appendix A) — rewrite non-compliant patterns
+    6. Start with: up{job="<value>"} to confirm service exists [if checking existence]
+    7. query_prometheus(expr=..., startTime=..., endTime=...)
+    8. Analyze: trend, spike, anomaly
 
 #### Loki Workflow
     1. Resolve datasource UID
     2. list_loki_label_names → discover label keys
     3. list_loki_label_values(labelName="k8s_deployment_name") → service value
        Try: exact → exact-default → exact-prod
-    4. Apply LogQL checklist (Appendix B) — rewrite non-compliant patterns
-    5. query_loki_stats({narrowest_selector}) — MANDATORY; if >1M entries, narrow first
-    6. query_loki_logs(logql=..., limit=10, direction="backward")
+    4. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
+    5. Apply LogQL checklist (Appendix B) — rewrite non-compliant patterns
+    6. query_loki_stats({narrowest_selector}) — MANDATORY; if >1M entries, narrow first
+    7. query_loki_logs(logql=..., limit=10, direction="backward")
        Append: | line_format "{{.__line__}}" to minimise payload
        Expand cautiously: 10 → 50 → 100
 
 #### Tempo Workflow
     1. Resolve datasource UID
     2. search_tempo_tag_values(attribute="resource.service.name") → confirm service
-    3. Apply TraceQL checklist (Appendix C) — rewrite non-compliant patterns
-    4. Lead with: { resource.service.name="<svc>" && <condition> }
+    3. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
+    4. Apply TraceQL checklist (Appendix C) — rewrite non-compliant patterns
+    5. Lead with: { resource.service.name="<svc>" && <condition> }
        Latency: duration > 500ms | Errors: status = error | HTTP: span.http.status_code = 500
-    5. query_tempo(query=..., limit=10, start=..., end=...)
-    6. For large datasets: | quantile_over_time(duration, 0.9) with(sample=true)
+    6. query_tempo(query=..., limit=10, start=..., end=...)
+    7. For large datasets: | quantile_over_time(duration, 0.9) with(sample=true)
 
 **After each backend:**
 - Extract 1–5 key findings.
@@ -400,22 +613,31 @@ Service names differ by backend due to labeling conventions:
 | "Backend 3 will have signal if 1+2 don't" | FORBIDDEN: 2 backends no signal = STOP |
 | "Pattern is clear enough for root cause" | FORBIDDEN: Pattern = WHAT, not WHY. Need metric/trace causality |
 | "Speculate if no evidence" | FORBIDDEN: State "no root cause found" explicitly |
+| **"Calculate answer from intermediate data"** | **FORBIDDEN: Query directly for what user asked. Actual data > derived calculations** |
+| **"rate() × time is close enough for counts"** | **FORBIDDEN: Use count aggregations (increase/count_over_time) for exact counts** |
+| **"Query planning is obvious, skip documentation"** | **FORBIDDEN: Complete Step −0.5 query plan template before EVERY analytical query** |
+| "Instant and Range queries are interchangeable" | FORBIDDEN: Instant returns ONE value, Range returns time-series. Match to user intent. |
 
 ---
 
 ## Red Flags — Stop and Re-Read Constraints
 
+**Universal Violations (Any Backend):**
 - Query constructed without prior label/service discovery
 - Analytical queries to two backends simultaneously  
 - Fabricating findings not returned by tools
 - Ignoring user's stated time scope
-- Starting Logs/Traces when Metrics unchecked and symptom does not require it
-- PromQL: wildcard regex, high-cardinality by, bare metric, step < scrape interval
-- LogQL: parser before filter, greedy regex, regexp parser
-- TraceQL: unscoped .attr, split selectors for same-span intent, >> without need
-- Expanding time window without query_loki_stats
+- **Using rate() × time instead of count functions for totals (ANY backend)**
+- **No query planning output before analytical/metrics query (Step −0.5 skipped)**
+- Expanding time window without stats check first
 - Root cause claim without backend evidence
 - Querying Backend 3 after Backends 1+2 both show no signal
+
+**Backend-Specific Violations:**
+- Starting Logs/Traces when Metrics unchecked and symptom does not require it
+- **PromQL:** wildcard regex, high-cardinality by, bare metric, step < scrape interval
+- **LogQL:** parser before filter, greedy regex, regexp parser
+- **TraceQL:** unscoped .attr, split selectors for same-span intent, >> without need
 
 Any of these → STOP. Re-read constraints. Restart from Step 1.
 
@@ -432,7 +654,10 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
 - [ ] Labels discovered in target backend
 - [ ] Service confirmed in target backend (tried variations)
 - [ ] PromQL / LogQL / TraceQL cost checklist passed (see Appendix)
-- [ ] query_loki_stats called before log retrieval
+- [ ] **Query planning output completed (Step −0.5) if analytical/metrics query**
+- [ ] **Correct function selected for user intent (count vs rate vs quantile, not derived)**
+- [ ] **Query type matches user intent (Instant for values, Range for trends)**
+- [ ] Stats check completed before high-volume retrieval (Loki, Tempo)
 - [ ] Findings from previous backend documented before querying next
 - [ ] Stop condition checked
 
@@ -449,6 +674,15 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
              Alerts directly explain symptom.
 **Step 1:** Alert confirms error spike. Fast-path: skip to root cause evidence.
 **Step 2:** Prometheus job = "payment-processor-prod" *(from alert labels — no discovery call needed)*
+**Step −0.5 (Query Planning):** Before querying error rate:
+    ```
+    Backend: Prometheus
+    User intent: RATE (user said "error rate")
+    Data structure needed: single value at incident time
+    Query type: Instant
+    Function: rate() over 5m lookback
+    Anti-pattern check: ❌ NOT using increase() / time
+    ```
 **Step 4 (Tier 2):** PromQL checklist ✓
     query_prometheus(expr="rate(http_errors_total{job=\"payment-processor-prod\"}[5m])")
     → 12% error rate from 14:32. DB connection metric:
@@ -562,6 +796,26 @@ filter → parser → label filter.
 
 Tempo stores data in Parquet columnar format. Cost = columns read × I/O.
 Only &&-only queries enable predicate pushdown into the Parquet layer.
+
+## TraceQL Metrics Functions (See Step −0.5)
+
+**Available metrics aggregation functions:**
+- `count_over_time()` — Exact span counts (use for totals, not rates × time)
+- `rate()` — Spans per second
+- `quantile_over_time(field, quantile)` — Percentiles (p50, p95, p99)
+- `avg_over_time(field)` — Average values
+- `min_over_time(field)` / `max_over_time(field)` — Min/max values
+- `sum_over_time(field)` — Sum of numeric fields
+
+**Query type selection:**
+- **Instant query** — Returns single aggregated value. Use when: "total X", "what is the count"
+- **Range query** — Returns time-series. Use when: "trend", "over time", "per minute"
+
+**Step parameter:**
+- Instant queries: Set to full window (e.g., 15m for 15-minute window)
+- Range queries: Set to resolution interval (e.g., 1m for per-minute data points)
+
+**See Step −0.5 for complete decision matrix and anti-patterns.**
 
 ## Mandatory Construction Rules
 
