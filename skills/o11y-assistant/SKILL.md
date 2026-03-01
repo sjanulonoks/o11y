@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.02
+version: 0.03
 description: >
   Use when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying observability backends (Prometheus/Mimir,
@@ -286,14 +286,19 @@ turns — do NOT re-discover what is already known:
 Always prefer cheaper signals first unless symptom type overrides:
 
     CHEAPEST ──────────────────────────────────────── MOST EXPENSIVE
-    Tier 1 — Alerts         list_alert_rules             ★☆☆☆☆
-    Tier 2 — Metrics        query_prometheus (PromQL)     ★★☆☆☆
-    Tier 3 — Traces         query_tempo (TraceQL)         ★★★☆☆
-    Tier 4 — Logs           query_loki_logs (LogQL)       ★★★★☆
+    Tier 0 — Grafana Alerts       list_alert_rules             ★☆☆☆☆
+             Annotations           get_annotations              ★☆☆☆☆
+    Tier 1 — Dashboards           search_dashboards            ★★☆☆☆
+             Rules Config          get_alert_rule_by_uid        ★★☆☆☆
+    Tier 2 — Metrics              query_prometheus (PromQL)     ★★☆☆☆
+    Tier 3 — Traces               query_tempo (TraceQL)         ★★★☆☆
+    Tier 4 — Logs                 query_loki_logs (LogQL)       ★★★★☆
 
-Default order: Alerts → Metrics → Traces → Logs
+Default order: Grafana Alerts → Annotations → Dashboards → Metrics → Traces → Logs
 
 Symptom overrides (document when applied):
+- Deployment/infrastructure event → check annotations first
+- Need context on dashboards/monitoring → search_dashboards
 - Stack trace / log pattern explicitly mentioned → start Tier 4
 - Slow dependency / distributed flow → start Tier 3
 - User names specific backend → honor it
@@ -354,31 +359,51 @@ hypothesis — document the shortcut.
 ### Utility
 - `datetime_get_current_time` — Resolve relative time to absolute UTC.
 
-### Datasource Resolution
-- `list_datasources` — Discover all datasources; filter by type.
-- `get_datasource_by_name` / `get_datasource_by_uid`
+### Grafana Configuration Discovery
+- `list_datasources` — Discover all datasources; filter by type (prometheus, loki, tempo). Returns datasource UIDs required for all backend queries.
+- `get_datasource` — Resolve datasource details by UID or name; useful for confirming datasource type/config.
 
-### Alerts
-- `list_alert_rules` — Pass datasourceUid + label_selector always.
+### Grafana Alerts & Rules
+- `list_alert_rules` — List Grafana-managed OR datasource-managed rules. ALWAYS include datasourceUid filter when querying backend-managed rules (Prometheus/Loki). Returns UID, title, state, labels.
+- `get_alert_rule_by_uid` — Retrieve full rule configuration (queries, condition, evaluation interval, annotations).
+- `list_contact_points` — Discover notification destinations; useful for alert routing investigation.
 
-### Prometheus / Mimir
-- `list_prometheus_metric_names`
-- `list_prometheus_metric_metadata` — Confirm metric type.
-- `list_prometheus_label_names`
-- `list_prometheus_label_values`
-- `query_prometheus` — Apply PromQL rules before every call.
+### Grafana Dashboards & Visualization
+- `search_dashboards` — Find dashboards by keyword; useful for discovering monitoring context for a service.
+- `get_dashboard_summary` — Quick dashboard overview (title, panel count, panel types, variables) without large JSON payload.
+- `get_dashboard_property` — Extract specific data from dashboards using JSONPath (e.g., all panel queries, variables).
+- `get_dashboard_panel_queries` — Retrieve all queries from a dashboard's panels; useful for understanding service instrumentation.
+- `get_panel_image` — Render dashboard panel as PNG; useful for capturing time-windowed evidence.
 
-### Loki
-- `list_loki_label_names`
-- `list_loki_label_values`
-- `query_loki_stats` — MANDATORY before any broad log pull.
-- `query_loki_logs` — Start limit=10. Apply LogQL rules.
+### Grafana Annotations
+- `get_annotations` — Query Grafana annotations (time-correlated events). Filter by dashboard, time range, tag, type.
+- `get_annotation_tags` — Discover available annotation tags; useful for finding deployment markers, maintenance windows.
 
-### Tempo (Traces)
-- `search_tempo_tags`
-- `search_tempo_tag_values`
-- `query_tempo` — Start limit=10. Apply TraceQL rules.
-- `get_tempo_trace`
+### Prometheus / Mimir (via Grafana Datasource)
+- `list_prometheus_metric_names` — Discover available metrics; apply regex filter.
+- `list_prometheus_metric_metadata` — Confirm metric type (counter/gauge/histogram).
+- `list_prometheus_label_names` — Discover label keys for a metric.
+- `list_prometheus_label_values` — Discover label values for label-metric combination.
+- `query_prometheus` — Execute PromQL instant or range query. Apply PromQL rules before every call.
+
+### Loki (via Grafana Datasource)
+- `list_loki_label_names` — Discover log stream label keys.
+- `list_loki_label_values` — Discover label values for stream selector.
+- `query_loki_stats` — MANDATORY before any broad log pull; returns stream count, entries, bytes.
+- `query_loki_logs` — Execute LogQL instant or range query. Start limit=10. Apply LogQL rules.
+- `query_loki_patterns` — Detect common log patterns automatically; useful for anomaly detection.
+
+### Tempo / Traces (via Grafana Datasource)
+- `gf-*_tempo_get-attribute-names` — Discover available span/resource attributes in TraceQL (scope: span, resource, event, link, instrumentation).
+- `gf-*_tempo_get-attribute-values` — Discover values for scoped attribute (e.g., resource.service.name, span.http.status_code).
+- `gf-*_tempo_traceql-search` — Execute TraceQL search query. Start limit=10. Apply TraceQL rules.
+- `gf-*_tempo_get-trace` — Retrieve full trace by ID; useful for deep-dive into single trace.
+- `gf-*_tempo_traceql-metrics-instant` — Execute TraceQL metrics query (aggregation: count, rate, quantile, avg). Instant returns single value.
+- `gf-*_tempo_traceql-metrics-range` — Execute TraceQL metrics query with time-series output.
+- `gf-*_tempo_docs-traceql` — Reference TraceQL syntax and operators.
+
+### Utility — Deeplinks
+- `generate_deeplink` — Create shareable links to Grafana resources (dashboard, panel, explore query). Supports time range injection.
 
 ---
 
@@ -397,22 +422,28 @@ For past-incident queries: set window around stated incident time ±15 min.
 
 ---
 
-### Step 0.5: Fast-Path Triage
+### Step 0.5: Fast-Path Triage (Grafana-First)
 
 **For LIVE incidents (now):** query firing alerts only.
 **For PAST incidents (historical window provided):** query both firing AND
 recently-resolved alerts within the incident window — this is the cheapest
 historical signal.
 
+#### Grafana Alerts + Annotations (MANDATORY first)
+
     1. list_datasources() → alert-capable datasource UID  [skip if in Session State]
-    2. list_alert_rules(datasourceUid=...,
-         label_selector=[{name:'state', type:'=', value:'firing'}])
-       For past windows, also query without state filter and filter by lastEvaluation
-       timestamp within the incident window.
+    2. Parallel calls (both safe):
+       a) list_alert_rules(datasourceUid=...,
+            label_selector=[{name:'state', type:'=', value:'firing'}])
+          For past windows, also query without state filter and filter by lastEvaluation
+          timestamp within the incident window.
+       b) get_annotations(From=<start_ms>, To=<end_ms>)  [for context: deployments, 
+          maintenance windows, manual events that correlate with incident timing]
     3. Firing/recently-resolved alerts found?
        → YES: Correlate with symptoms. Use alert labels as service discovery seed.
+              Cross-check with annotations for timing correlation.
               If alerts fully explain the symptom → go to Step 8 (Triage output).
-       → NO: Proceed to Step 1.
+       → NO: Check for relevant annotations; proceed to Step 1 if no context.
 
 ---
 
@@ -434,21 +465,27 @@ historical signal.
 **If vague name provided:**
 
 Discovery order — try each backend that is available; use first successful result:
-    1. search_tempo_tag_values(attribute="resource.service.name")  [prefer — OTel]
-    2. list_prometheus_label_values(labelName="job")               [fallback]
-    3. list_loki_label_values(labelName="service_name")            [fallback]
+    1. search_dashboards(query="<service_name>")        [prefer — find monitoring context]
+    2. search_tempo_tag_values(attribute="resource.service.name")  [prefer — OTel standard]
+    3. list_prometheus_label_values(labelName="job")    [fallback — Prometheus labels]
+    4. list_loki_label_values(labelName="service_name") [fallback — Loki labels]
 
-If multiple matches: list them and ask the user to confirm before proceeding.
+If search_dashboards returns matches: retrieve get_dashboard_summary + get_dashboard_panel_queries
+to understand service instrumentation (what metrics/traces/logs are being collected).
+
+If multiple service matches: list them and ask the user to confirm before proceeding.
 
 Output + store in Session State:
 
     ### SERVICE DISCOVERY
     User provided: "[term]"
-    Discovered:    tempo: resource.service.name = "[exact]"
-    Loki mapping:  k8s_deployment_name = "[exact]" | "[exact]-default" | "[exact]-prod"
-                   service_name = "[exact]"
-    Prometheus:    job = "[exact]" | "[exact]-prod"
-                   service = "[exact]"
+    Dashboards found: [list + panel count]
+    Service mapping:
+      Tempo: resource.service.name = "[exact]"
+      Loki: k8s_deployment_name = "[exact]" | "[exact]-default" | "[exact]-prod"
+            service_name = "[exact]"
+      Prometheus: job = "[exact]" | "[exact]-prod"
+                  service = "[exact]"
 
 ---
 
@@ -483,7 +520,10 @@ strictly sequential.
     5. Apply PromQL checklist (Appendix A) — rewrite non-compliant patterns
     6. Start with: up{job="<value>"} to confirm service exists [if checking existence]
     7. query_prometheus(expr=..., startTime=..., endTime=...)
-    8. Analyze: trend, spike, anomaly
+    8. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=...) to share query
+    9. Analyze: trend, spike, anomaly
+    10. **Optional:** If needed for dashboard context → search_dashboards(query="<service>") 
+        and retrieve get_dashboard_panel_queries to understand instrumentation
 
 #### Loki Workflow
     1. Resolve datasource UID
@@ -493,19 +533,24 @@ strictly sequential.
     4. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
     5. Apply LogQL checklist (Appendix B) — rewrite non-compliant patterns
     6. query_loki_stats({narrowest_selector}) — MANDATORY; if >1M entries, narrow first
-    7. query_loki_logs(logql=..., limit=10, direction="backward")
+    7. **Optional:** query_loki_patterns({selector}) to detect anomalies automatically
+    8. query_loki_logs(logql=..., limit=10, direction="backward")
        Append: | line_format "{{.__line__}}" to minimise payload
        Expand cautiously: 10 → 50 → 100
+    9. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=...) to share query
 
 #### Tempo Workflow
     1. Resolve datasource UID
-    2. search_tempo_tag_values(attribute="resource.service.name") → confirm service
+    2. gf-*_tempo_get-attribute-values(name="resource.service.name") → confirm service
     3. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
     4. Apply TraceQL checklist (Appendix C) — rewrite non-compliant patterns
     5. Lead with: { resource.service.name="<svc>" && <condition> }
        Latency: duration > 500ms | Errors: status = error | HTTP: span.http.status_code = 500
-    6. query_tempo(query=..., limit=10, start=..., end=...)
+    6. gf-*_tempo_traceql-search(query=..., limit=10, start=..., end=...)
     7. For large datasets: | quantile_over_time(duration, 0.9) with(sample=true)
+    8. **Optional:** gf-*_tempo_get-trace(trace_id=...) for single-trace deep dive
+    9. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=...) to share query
+    10. **Optional:** gf-*_tempo_get-attribute-names(scope="span") to discover available span attributes
 
 **After each backend:**
 - Extract 1–5 key findings.
@@ -617,10 +662,27 @@ Service names differ by backend due to labeling conventions:
 | **"rate() × time is close enough for counts"** | **FORBIDDEN: Use count aggregations (increase/count_over_time) for exact counts** |
 | **"Query planning is obvious, skip documentation"** | **FORBIDDEN: Complete Step −0.5 query plan template before EVERY analytical query** |
 | "Instant and Range queries are interchangeable" | FORBIDDEN: Instant returns ONE value, Range returns time-series. Match to user intent. |
+| **"Skip list_alert_rules and annotations — go straight to metrics"** | **FORBIDDEN: Grafana Alerts + Annotations are Tier 0 (cheapest). ALWAYS start here. A single list_alert_rules call is 10× cheaper than metric queries. Empty alert list = evidence too. Checking alerts even when you 'know' the root cause is symptom bias.** |
+| **"Don't search dashboards — just query backends directly"** | **FORBIDDEN: Dashboards provide service discovery AND instrumentation context. Query Prometheus blindly → risk false causality (wrong metric, mislabeled series). Search dashboards FIRST (lines 469–476). One query search beats 5 metric queries. Prevents time-wasting dead ends.** |
+| **"Service name won't match — skip service discovery"** | **FORBIDDEN: Service discovery includes dashboard, Tempo, Prometheus, Loki mappings. One WILL match. If dashboard fails, Tempo succeeds (OTel standard). Service discovery is NOT optional — it IS the efficiency strategy.** |
+| **"Skip get_annotations — focus on the symptom"** | **FORBIDDEN: Annotations correlate timing with events (deployments, maintenance, manual interventions). Even non-deployment annotations (e.g., "performance baseline changed") explain spikes. Checking annotations = verifying incident timing is real AND not coincidental. MANDATORY.** |
+| **"Alerts won't fire for my symptom — skip alert check"** | **FORBIDDEN: This is symptom bias. Alert rules are configuration + threshold policy. (A) You don't know if alerts exist; (B) you don't know if threshold was tuned; (C) absence of alerts still provides evidence. Checking alerts costs ~0ms. Prevents hours of metric chasing.** |
+| **"Dashboards are nice-to-have context, not required"** | **FORBIDDEN: Dashboards prevent false root cause. Without dashboard context: you may query a metric that happens to correlate but is NOT causal. Dashboard queries FORCE you to see what's actually instrumented. Skipping = hypothesis without instrumentation check.** |
 
 ---
 
 ## Red Flags — Stop and Re-Read Constraints
+
+**Grafana-Specific Violations:**
+- Skipped list_alert_rules or get_annotations (Tier 0 signals) — even if you believe alerts won't fire for the symptom
+- Did NOT search_dashboards for service discovery — attempted metric query without first checking instrumentation
+- Queried backend without dashboard context of instrumentation (e.g., "I'll find the metric first, then check dashboard")
+- No service mapping across multiple backends — skipped discovery because "service name looks obvious"
+- Queried Tempo/Loki without gf-*_tempo_get-attribute-values or list_loki_label_values first
+- Used old tool names (search_tempo_tags, query_tempo) instead of gf-*_tempo_* variants
+- Justified skipping alerts by reasoning "alerts only fire on threshold breaches, not gradual issues"
+- Justified skipping dashboards by reasoning "I'll query metrics directly and verify instrumentation later"
+- Justified skipping annotations by reasoning "symptom doesn't look like deployment, so no annotations relevant"
 
 **Universal Violations (Any Backend):**
 - Query constructed without prior label/service discovery
@@ -645,6 +707,8 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
 
 ## Efficiency Checklist (Before Each Backend Query)
 
+- [ ] **Grafana Alerts checked:** list_alert_rules(state=firing) or get_annotations completed
+- [ ] **Dashboards searched:** search_dashboards for service name; context retrieved
 - [ ] Time window defined (default: last 15 min)
 - [ ] Signal cost hierarchy applied or override documented
 - [ ] Session State checked — reuse known UIDs/mappings before re-discovering
@@ -660,6 +724,7 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
 - [ ] Stats check completed before high-volume retrieval (Loki, Tempo)
 - [ ] Findings from previous backend documented before querying next
 - [ ] Stop condition checked
+- [ ] **Optional:** generate_deeplink created for shareable context
 
 ---
 
@@ -669,11 +734,15 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
 
 **Step −1:** INVESTIGATE mode. Expert user (service + time provided).
 **Step 0:** Window: 14:15–14:50 UTC. *(reuse if in Session State)*
-**Step 0.5:** list_alert_rules(firing) → `PaymentHighErrorRate FIRING since 14:32`.
-             Alert labels: `job=payment-processor-prod, severity=critical`.
-             Alerts directly explain symptom.
-**Step 1:** Alert confirms error spike. Fast-path: skip to root cause evidence.
+**Step 0.5:** 
+    1. list_alert_rules(datasourceUid=..., state=firing) → `PaymentHighErrorRate FIRING since 14:32`.
+       Alert labels: `job=payment-processor-prod, severity=critical`.
+    2. get_annotations(From=14:15 UTC, To=14:50 UTC) → deployment marker at 14:30 UTC found.
+       Alerts + annotations directly explain symptom timing.
+**Step 1:** Alert + annotation confirms error spike + deployment timing. Fast-path: skip to root cause evidence.
 **Step 2:** Prometheus job = "payment-processor-prod" *(from alert labels — no discovery call needed)*
+           search_dashboards("payment-processor") → dashboard "Payment Service Overview" found
+           get_dashboard_summary(...) → 12 panels, includes database connection metrics
 **Step −0.5 (Query Planning):** Before querying error rate:
     ```
     Backend: Prometheus
@@ -684,16 +753,19 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
     Anti-pattern check: ❌ NOT using increase() / time
     ```
 **Step 4 (Tier 2):** PromQL checklist ✓
-    query_prometheus(expr="rate(http_errors_total{job=\"payment-processor-prod\"}[5m])")
+    query_prometheus(expr="rate(http_errors_total{job=\"payment-processor-prod\"}[5m])", startTime="14:32 UTC")
     → 12% error rate from 14:32. DB connection metric:
-    query_prometheus(expr="postgres_connections_used{job=\"payment-processor-prod\"}")
+    query_prometheus(expr="postgres_connections_used{job=\"payment-processor-prod\"}", startTime="14:32 UTC")
     → 248/250 at 14:32 — connection pool exhausted.
+    generate_deeplink(resourceType="explore", datasourceUid=..., queryParams={expr="..."})
+    → Share dashboard context + queries with team
 **Step 5:** Root cause found. Stop. Known failure pattern: "connection pool".
 **Step 8 (TRIAGE):**
     🔴 payment-processor-prod: 12% error rate from 14:32 UTC.
-    Root cause: PostgreSQL connection pool exhausted (248/250) — likely connection leak.
+    Root cause: PostgreSQL connection pool exhausted (248/250) — correlates with 14:30 UTC deployment.
+    Context: Dashboard "Payment Service Overview" shows 12 instrumented metrics; connection pool was not monitored before.
     Immediate: restart service to free connections; check for missing connection.close().
-    Preventative: alert on pool utilisation >80%; add connection timeout + pool size metric.
+    Preventative: alert on pool utilisation >80%; add connection timeout + pool size metric to dashboard.
 
 ---
 
