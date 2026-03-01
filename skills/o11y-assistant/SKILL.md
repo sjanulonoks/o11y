@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.03
+version: 0.11
 description: >
   Use when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying observability backends (Prometheus/Mimir,
@@ -46,8 +46,9 @@ Route:
                 (Prometheus: top error rates + UP metrics) → Step 8 Triage
 - VALIDATE    → Step 0 → Step 2 (service discovery) → directly query the
                 backend most relevant to the hypothesis → confirm/deny → Step 8
-- DISCOVER    → list_datasources + search_tempo_tag_values + list_alert_rules
-                → structured catalogue response; no deep analysis
+- DISCOVER    → list_datasources + search_dashboards + search_folders + 
+                 search_tempo_tag_values + list_alert_rules + get_query_examples
+                 → structured catalogue response; no deep analysis
 
 **User expertise inference:**
 - Vague symptom ("things are slow") → novice path: explain each step briefly
@@ -343,7 +344,9 @@ hypothesis — document the shortcut.
 | Parallel-safe discovery | datetime_get_current_time + list_datasources MAY run concurrently.|
 |                         | list_alert_rules + first label discovery MAY run concurrently     |
 |                         | when service name is known. Analytical queries: never parallel.   |
+|                         | **MCP tool discovery (Tempo):** Per-session, protected by sync.Once, safe for 100+ concurrent calls. |
 | Cross-system label mapping | Map service labels to all backends upfront after discovery.    |
+| Session isolation       | Each user session has separate MCP tool state. No state leakage across users. |
 | Time discipline         | Default: last 15 min. Expand only if justified — state why.       |
 | Evidence-based conclusions | Root cause = tool evidence. OR state "no root cause found".   |
 | No blind queries        | Always discover labels before constructing queries.               |
@@ -359,21 +362,117 @@ hypothesis — document the shortcut.
 ### Utility
 - `datetime_get_current_time` — Resolve relative time to absolute UTC.
 
+- `get_query_examples` — Discover backend-specific query examples for rapid instrumentation understanding. Call when user asks "what queries should I run?" or "show me examples for <datasource>".
+  
+  **Purpose:** Provide ready-to-use query templates for Prometheus, Loki, ClickHouse, and CloudWatch. Accelerates hypothesis formation by showing real metric/log patterns available in each backend.
+  
+  **Parameters:**
+  - `DatasourceType` (required, string, case-insensitive): "prometheus", "loki", "clickhouse", or "cloudwatch"
+  
+  **Return structure:**
+  - `DatasourceType` (string, normalized to lowercase in response)
+  - `Examples` (array of example objects)
+  - Each example object contains:
+    - `Name` (string): Human-readable example name (non-empty)
+    - `Description` (string): Brief description of what the example measures (non-empty)
+    - **For Prometheus/Loki/ClickHouse:** `Query` (string): Ready-to-execute query string
+    - **For CloudWatch only:** `Namespace` (string), `MetricName` (string), `Dimensions` (array/object with field names like `ClusterName`, `InstanceId`, `FunctionName`)
+  
+  **Backend-specific behaviors:**
+  
+  | Datasource | Query Field | Structure | Examples |
+  |-----------|-----------|-----------|----------|
+  | **Prometheus** | ✅ Query (string) | PromQL expressions with operators, functions | `rate(http_requests_total[5m])`, `histogram_quantile(0.95, ...)`, `sum by (job) (up)` |
+  | **Loki** | ✅ Query (string) | LogQL matchers, filters, JSON parsing | `{job="<service>"} \|= "error"`, `{} \| json \| status >= 500`, `sum(rate(...)) by (status)` |
+  | **ClickHouse** | ✅ Query (string) | SQL with ClickHouse macros (`$__timeFilter`, `$__timeInterval`) | Uses `$__timeFilter` for time range filtering |
+  | **CloudWatch** | ❌ No Query field | Namespace + MetricName + Dimensions | AWS service namespaces like `AWS/ECS`, `AWS/EC2`, `AWS/RDS`, `AWS/Lambda` |
+  
+  **Case-insensitivity:** DatasourceType parameter is case-insensitive. Inputs "PROMETHEUS", "Prometheus", "prometheus" all normalize to "prometheus" in response DatasourceType field.
+  
+  **Error handling:**
+  - Unsupported datasources (mysql, postgres, elasticsearch, unknown, empty string) return error
+  - Error message includes text "unsupported datasource type" and lists supported types
+  - No results returned on error; investigate error message for correct datasource name
+  
+  **When to use in workflow:**
+  - DISCOVER path: User asks "what can I monitor?" → Call `get_query_examples(DatasourceType="prometheus")` to show available metric patterns
+  - Step 2 Service Discovery: After identifying service, call examples tool to see what instrumentation exists
+  - Hypothesis formation: Show user what metrics/logs are available before diving into analysis
+  - Cross-backend exploration: Show Prometheus examples, then Loki examples, to understand multi-layer instrumentation
+  
+  **Example usage workflow:**
+  ```
+  1. User: "What metrics can I query for latency?"
+  2. Call: get_query_examples(DatasourceType="prometheus")
+  3. Response shows: "histogram_quantile(0.95, ...)" under "95th percentile latency"
+  4. Extract and adapt query for actual service: histogram_quantile(0.95, http_request_duration_bucket{service="<service>"})
+  5. Execute with query_prometheus()
+  ```
+
 ### Grafana Configuration Discovery
-- `list_datasources` — Discover all datasources; filter by type (prometheus, loki, tempo). Returns datasource UIDs required for all backend queries.
-- `get_datasource` — Resolve datasource details by UID or name; useful for confirming datasource type/config.
+- `list_datasources` — Discover all datasources; filter by type (prometheus, loki, tempo, alertmanager, etc.). Returns datasource UIDs required for all backend queries. Supports pagination with `limit` (max 100, default 50) and `offset`. Returns `total` count and `hasMore` flag for pagination tracking.
+   
+   **Behavior:** Type filter returns exact matches only (e.g., type="prometheus" filters only Prometheus datasources). No combined filters (e.g., prometheus OR loki). Pagination works correctly with hasMore indicating when more results available.
+
+- `get_datasource` — Resolve datasource details by UID or name; useful for confirming datasource type/config, discovery paths, or cross-datasource linking.
+  
+  **UID takes priority:** When both UID and Name provided, UID is used. Provide UID when possible for deterministic routing.
+  
+  **Returns complete config:** Includes access mode, jsonData (complex nested config), URL, typeLogoUrl, secureJsonFields (marked but not included in response for security).
+  
+   **Error handling:** Non-existent datasources return informative error message "datasource with UID '{uid}' not found. Please check if the datasource exists and is accessible".
+   
+   **Cross-datasource linking patterns:** Datasources commonly reference other datasources via UIDs:
+  - Prometheus exemplarTraceIdDestinations → Tempo UIDs
+  - Loki derivedFields → Tempo trace UIDs with regex patterns
+  - Alertmanager references in jsonData
+  
+  These cross-datasource links are useful for tracing data flows during investigation.
 
 ### Grafana Alerts & Rules
 - `list_alert_rules` — List Grafana-managed OR datasource-managed rules. ALWAYS include datasourceUid filter when querying backend-managed rules (Prometheus/Loki). Returns UID, title, state, labels.
+  
+  **🔴 CRITICAL LIMIT WARNING:** Default `limit=100`. If you don't explicitly increase it, you see only first 100 rules and may conclude "no firing alerts" when actually 11+ are firing. **ALWAYS use `limit=1000` or higher** when checking alerts, especially for firing/pending state queries. This is the most common cause of false-negative alert checks.
+  
+  **🔴 STATE FILTERING IS IMPOSSIBLE:** The `label_selectors` parameter filters by **alert labels** (e.g., `severity`, `job`), NOT by alert `state`. The `state` field is a response property, not a label. Attempting `label_selectors=[{name: "state", ...}]` returns `[]` because no such label exists. **DO NOT attempt to filter by state server-side.** Correct approach: (1) fetch all rules with `limit=1000+` (no state filter), (2) filter locally by state field in results. State is included in every response and can be filtered client-side without data loss.
+
 - `get_alert_rule_by_uid` — Retrieve full rule configuration (queries, condition, evaluation interval, annotations).
 - `list_contact_points` — Discover notification destinations; useful for alert routing investigation.
 
 ### Grafana Dashboards & Visualization
-- `search_dashboards` — Find dashboards by keyword; useful for discovering monitoring context for a service.
+- `search_dashboards` — Find dashboards by keyword (substring search, case-insensitive). Returns array of dashboards with metadata.
+  - **Parameters**: `query` (string, e.g., "api-gateway", "payment-service"), `limit` (optional, default 50), `page` (optional, default 1)
+  - **Result structure**: Array of dashboard objects with fields: `uid` (string), `title`, `type` ("dash-db" = dashboard), `tags` (array), `uri` (path)
+  - **Usage**: `search_dashboards(query="<service_name>")` → extract `uid` from result → use with `get_dashboard_summary` or `get_dashboard_panel_queries`
+  - **Empty results**: Returns empty array if no dashboards match; expected behavior (dashboard may not exist for service)
+  - **When to use during investigation**: After discovering service name (Step 2), search for dashboards to understand existing instrumentation
+  
+- `search_folders` — Find dashboard folders by keyword (substring search, case-insensitive). Returns array of folder objects.
+  - **Parameters**: `query` (string, e.g., "monitoring", "prod"), `limit` (optional, default 50), `page` (optional, default 1)
+  - **Result structure**: Array of folder objects with fields: `uid`, `title`, `type` ("dash-folder" = folder), `tags`, `uri`
+  - **Usage**: Useful for organizational discovery; navigate folder structure to locate relevant dashboards
+  - **When to use**: DISCOVER path when user asks for "available monitoring" or to understand dashboard organization
+  
 - `get_dashboard_summary` — Quick dashboard overview (title, panel count, panel types, variables) without large JSON payload.
 - `get_dashboard_property` — Extract specific data from dashboards using JSONPath (e.g., all panel queries, variables).
 - `get_dashboard_panel_queries` — Retrieve all queries from a dashboard's panels; useful for understanding service instrumentation.
 - `get_panel_image` — Render dashboard panel as PNG; useful for capturing time-windowed evidence.
+
+  **🔴 CRITICAL LIMITS WARNING:**
+  
+  These tools are for **analysis and investigation only**. Use them to understand instrumentation context, extract queries for verification, or discover service monitoring patterns. Do NOT attempt modifications.
+  
+  **JSONPath Limitations:** `get_dashboard_property` does NOT support object projection syntax `{field1, field2}`. Supported patterns:
+  - ✅ `$.title` — Get string properties
+  - ✅ `$.panels[*].title` — Get array of values
+  - ✅ `$.panels[0:5].title` — Slice array
+  - ❌ `$.panels[*].{id,title,type}` — Object projection NOT supported
+  
+  Workaround: Make separate calls for each field (`$.panels[*].id`, `$.panels[*].title`, etc.).
+  
+  **Variable Resolution:** Some panels reference `${datasource}` or other variables instead of concrete UIDs. These cannot be executed as queries. Check `dashboard.templating.list` to understand variable definitions and required context.
+  
+  **Missing Query Validation:** Panels with type="text", "dashlist", "alertlist" have no queries. Do not assume all panels have a `targets` array or `query` field.
 
 ### Grafana Annotations
 - `get_annotations` — Query Grafana annotations (time-correlated events). Filter by dashboard, time range, tag, type.
@@ -387,23 +486,351 @@ hypothesis — document the shortcut.
 - `query_prometheus` — Execute PromQL instant or range query. Apply PromQL rules before every call.
 
 ### Loki (via Grafana Datasource)
-- `list_loki_label_names` — Discover log stream label keys.
-- `list_loki_label_values` — Discover label values for stream selector.
-- `query_loki_stats` — MANDATORY before any broad log pull; returns stream count, entries, bytes.
-- `query_loki_logs` — Execute LogQL instant or range query. Start limit=10. Apply LogQL rules.
-- `query_loki_patterns` — Detect common log patterns automatically; useful for anomaly detection.
+- `list_loki_label_names` — Discover log stream label keys. Returns array of label names available in datasource for configured time range. Different Loki instances may have different label sets depending on how logs are collected.
 
-### Tempo / Traces (via Grafana Datasource)
-- `gf-*_tempo_get-attribute-names` — Discover available span/resource attributes in TraceQL (scope: span, resource, event, link, instrumentation).
-- `gf-*_tempo_get-attribute-values` — Discover values for scoped attribute (e.g., resource.service.name, span.http.status_code).
-- `gf-*_tempo_traceql-search` — Execute TraceQL search query. Start limit=10. Apply TraceQL rules.
-- `gf-*_tempo_get-trace` — Retrieve full trace by ID; useful for deep-dive into single trace.
-- `gf-*_tempo_traceql-metrics-instant` — Execute TraceQL metrics query (aggregation: count, rate, quantile, avg). Instant returns single value.
-- `gf-*_tempo_traceql-metrics-range` — Execute TraceQL metrics query with time-series output.
-- `gf-*_tempo_docs-traceql` — Reference TraceQL syntax and operators.
+- `list_loki_label_values` — Discover label values for specific label name. Returns array of unique values.
+  
+  **🟡 High cardinality warning:** Label values can be extremely large (e.g., deployment names, service identifiers). When discovering values for broad labels without filters, result sets may be slow, timeout, or return incomplete results. **Pattern: Always filter to a known higher-level label first** (e.g., namespace, cluster) before exploring high-cardinality labels. This prevents slow queries and backend strain.
+
+- `query_loki_stats` — **MANDATORY before any broad log pull.** Returns stream count, entries count, bytes for a selector. Use to estimate data volume before executing full log query.
+  
+  **Graceful empty handling:** Non-existent or empty selectors return `{"streams":0,"chunks":0,"entries":0,"bytes":0}` without error. Use stats to validate selector before querying logs—confirms label names/values exist and estimate data volume (fast ~100MB queries vs slow >1GB queries).
+
+- `query_loki_logs` — Execute LogQL instant or range query. Start limit=10. Apply LogQL rules. Supports `queryType` parameter.
+  
+  **🔴 CRITICAL: Timestamp format differences:**
+  - **Log entries (raw logs):** Timestamps are **quoted nanosecond strings** (e.g., `"1772393788776911586"`). To parse: convert to int64 nanoseconds, divide by 1e9 for Unix seconds.
+  - **Metric instant queries:** Timestamps are **Unix seconds as numbers** (e.g., `1772394323.574`). Direct epoch use.
+  - **Metric range queries:** Same Unix seconds format with values array for time-series data.
+  
+  Mixing these formats is a common source of timestamp parsing bugs. **Always check the data structure before converting timestamps.**
+  
+  **Query type behavior:**
+  - queryType="range" (default): Returns time-series data with multiple [timestamp, value] pairs. Use for historical analysis and trends.
+  - queryType="instant": Returns single-point metric value at query end time. Use for "current status" queries (e.g., error count right now).
+  - Log queries (raw logs): queryType parameter may not apply; logs always return all matching entries in time range (limit applies).
+  
+  **Direction parameter (logs only):**
+  - direction="backward" (default): Newest logs first. Use for "what just happened" investigation.
+  - direction="forward": Oldest logs first. Use for "trace sequence of events chronologically" investigation.
+  - Direction affects sort order AND cursoring; same selector with different direction may return different temporal windows.
+  
+  **Empty results handling (NOT an error):** When no logs match selector, returns empty array WITH helpful hints (possibleCauses, suggestedActions, debug timeRange). Use hints for troubleshooting selector errors.
+  
+  **LogQL pattern for metrics (examples):**
+  - `sum by(label_name) (count_over_time({selector}[5m]))` — Count logs per label over time window
+  - `rate({selector}[1m])` — Log ingestion rate (logs/second)
+  - **Pattern: Always start with small time windows** (e.g., `[5m]`) and add filters before aggregating across many series. Unfiltered rate() over thousands of label values causes backend overload.
+
+- `query_loki_patterns` — Detect common log patterns automatically using pattern inference. Useful for anomaly detection (unusual log format = potential error in logging).
+   
+   **Graceful feature:** May return empty array `[]` when logs follow single consistent format (not an error, patterns optional). Use when investigating multi-service logs to detect formatting anomalies or unexpected log structures.
+
+- `search_logs` — **Quick pattern search across Loki or ClickHouse logs.** Supports both simple text (literal substring match) and regex patterns. Automatically generates backend-specific queries, escapes special characters, and provides hints when no results found. Returns paginated results with per-log labels and timestamps.
+   
+    **Parameters:**
+    - `DatasourceUID` (string, required) — Loki or ClickHouse datasource UID
+    - `Pattern` (string, required) — Search pattern (simple text or regex)
+    - `Start` (string, optional) — Query start time. See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters) for details. Quick: relative like `"now-1h"` or absolute RFC3339 like `"2024-01-15T10:00:00Z"`.
+    - `End` (string, optional) — Query end time. See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters) for details. Quick: relative like `"now"` or absolute RFC3339.
+    - `Limit` (int, optional) — Max results to return; default 100, max 1000 (enforced by backend)
+   
+   **Pattern types (auto-detected):**
+   - **Simple text** (no regex metacharacters): `"error"`, `"connection refused"`, `"api-gateway"` → Literal substring search
+   - **Regex patterns** (contains `.`, `*`, `+`, `?`, `^`, `$`, `[]`, `()`, `{}`, `|`, `\`): `"error|warning"`, `"^timeout"`, `"[Ee]rror"` → Regex match
+   
+   **Backend-specific query generation:**
+   - **Loki simple text**: Generates `{} |= "pattern"` (line contains filter)
+   - **Loki regex**: Generates `{} |~ "pattern"` (regex filter)
+   - **ClickHouse simple text**: Generates `ILIKE '%pattern%'` (SQL ILIKE operator)
+   - **ClickHouse regex**: Generates `match(Body, 'pattern')` (regex match function)
+   
+   **Character escaping (automatic):**
+   - **LogQL**: Double quotes (`"`) → `\"`, backslashes (`\`) → `\\`
+   - **ClickHouse**: Single quotes (`'`) → `''` (doubled), percent (`%`) → `\%`, underscore (`_`) → `\_`
+   - Do NOT manually escape; tool handles all escaping
+   
+   **Result structure:**
+   - `Logs` (array): Each log entry with `Timestamp` (RFC3339 or quoted nanoseconds for Loki), `Message` (log body), `Labels` (map of label:value pairs)
+   - `DatasourceType` (string): "loki" or "clickhouse" (indicates which backend executed query)
+   - `Query` (string): The actual executed query (useful for debugging or manual refinement)
+   - `TotalFound` (int): Count of matching logs found
+   - `Hints` (array): Backend-specific suggestions when no results found (e.g., "Try simpler pattern", "Check label names", "Verify time range")
+   
+   **Empty result handling (NOT an error):**
+   - Returns empty `Logs` array with `TotalFound=0` and `Hints` array explaining possible reasons
+   - **Loki hints**: Suggests `list_loki_label_names()`, `query_loki_stats()` to validate selector
+   - **ClickHouse hints**: Suggests `list_clickhouse_tables()`, `describe_clickhouse_table()` to verify schema
+   - **Regex hints** (when pattern uses regex): Include "Regex pattern used; verify regex syntax"
+   
+   **Limit behavior:**
+   - Input `Limit=0` or negative → uses default (100)
+   - Input `Limit > 1000` → capped at 1000 (backend maximum)
+   - Requested results may return fewer entries if backend timeout or stream limits reached
+   
+   **When to use:** Quick interactive searches during investigation ("show me all timeout errors", "find payment failures"). Use `query_loki_logs` with full LogQL for complex filtering, metric aggregations, or pattern inference.
+   
+   **When NOT to use:** For high-cardinality pattern searches without label filters (very slow). Instead: Use `list_loki_label_names/values` → narrow selector → then `search_logs` with filtered datasource context.
+
+### Tempo / Traces (via Grafana Datasource + MCP Proxying)
+
+**Core Requirement:** ALL Tempo tools require `datasourceUid` parameter (string, camelCase, required). Tools are discovered per-session via MCP proxy and registered automatically per Tempo datasource.
+
+**Available Tools:**
+
+- `tempo_get-attribute-names` — Discover available span/resource attributes in TraceQL. Optional `scope` parameter filters by type: `span`, `resource`, `event`, `link`, `instrumentation`. If omitted, returns all attributes. Requires `datasourceUid`.
+- `tempo_get-attribute-values` — Discover values for scoped attribute (e.g., resource.service.name, span.http.status_code). Optional `filter-query` parameter narrows results (see **Filter-Query Constraints** below). Requires `datasourceUid`.
+- `tempo_traceql-search` — Execute TraceQL **search query** (finds traces matching criteria). Use when looking for specific traces. Start limit=10. Apply TraceQL rules. Requires `datasourceUid`. **Note:** Do NOT send metrics queries (with aggregations) to this tool; use `tempo_traceql-metrics-instant` or `tempo_traceql-metrics-range` instead.
+- `tempo_get-trace` — Retrieve full trace by ID; useful for deep-dive into single trace. Requires `datasourceUid`.
+- `tempo_traceql-metrics-instant` — Execute TraceQL **metrics query** (count, rate, quantile, avg aggregations). Returns single instant value. Use when aggregating across multiple traces. Requires `datasourceUid`. **Note:** Do NOT send search queries to this tool; use `tempo_traceql-search` instead.
+- `tempo_traceql-metrics-range` — Execute TraceQL **metrics query** with time-series output (same aggregations as instant, but returns multiple points). Use for trend analysis. Requires `datasourceUid`. **Note:** Do NOT send search queries to this tool; use `tempo_traceql-search` instead.
+- `tempo_docs-traceql` — Reference TraceQL syntax and operators. Requires `datasourceUid`.
+
+**datasourceUid Parameter (Required for ALL Tools):**
+- **Type:** String
+- **Origin:** Obtained from `list_datasources(type="tempo")` 
+- **Purpose:** Routes tool execution to correct Tempo datasource instance
+- **Multi-datasource:** Same tool name with different datasourceUid values = different Tempo instances (enables investigating prod+staging simultaneously)
+
+**Query Type Validation: Search vs Metrics (Critical Distinction)**
+
+Tempo tools validate your query type BEFORE execution and reject mismatched queries with helpful error messages:
+
+| Query Type | Purpose | Keywords | Use Tool | ❌ Do NOT Use |
+|---|---|---|---|---|
+| **Search** | Find specific traces matching criteria | `{ }` span/resource filter syntax, no aggregation | `tempo_traceql-search` | `tempo_traceql-metrics-*` |
+| **Metrics** | Aggregate across multiple traces | `count()`, `rate()`, `quantile()`, `avg()`, `sum()` | `tempo_traceql-metrics-instant` or `tempo_traceql-metrics-range` | `tempo_traceql-search` |
+
+**Error Handling for Query Type Mismatch:**
+- ❌ Sending search query to metrics tool → Error: "TraceQL search query received on instant query tool. Use `tempo_traceql-search` tool instead"
+- ❌ Sending metrics query to search tool → Error: "TraceQL metrics query received on search tool. Use `tempo_traceql-metrics-instant` or `tempo_traceql-metrics-range` instead"
+
+**How to Identify Query Type:**
+- **Search query example:** `{ resource.service.name="api" && span.http.status_code=500 }` (filters, no aggregation)
+- **Metrics query example:** `count() by(resource.service.name)` (aggregation function present)
+
+**Filter-Query Constraints (tempo_get-attribute-values Only)**
+
+The `tempo_get-attribute-values` tool accepts an optional `filter-query` parameter to narrow results. This parameter has strict syntax rules enforced by Tempo:
+
+| Constraint | Valid | Invalid | Example |
+|---|---|---|---|
+| **Number of spansets** | Exactly ONE | Multiple spansets | ✅ `{ service="api" && status=500 }` / ❌ `{ service="api" } { status=500 }` |
+| **Logical operators** | `&&` (AND) only | `\|\|` (OR) not allowed | ✅ `{ service="api" && status=500 }` / ❌ `{ service="api" \|\| service="web" }` |
+| **Condition format** | `attribute=value` | Arbitrary syntax | ✅ `{ resource.service.name="api" && span.http.status_code=500 }` |
+
+**Error for Invalid filter-query:**
+```
+Error: "filter-query invalid. It can only have one spanset and only &&'ed conditions like { <cond> && <cond> && ... }"
+```
+
+**Use case:** Narrow attribute value discovery to specific conditions. Example:
+```
+tempo_get-attribute-values(
+  datasourceUid="<uid>",
+  name="span.http.endpoint",
+  filter-query="{ resource.service.name=\"api\" && span.http.status_code=500 }"
+)
+→ Returns only HTTP endpoints that appear in error traces for the "api" service
+```
+
+**Scope Parameter (tempo_get-attribute-names Only)**
+
+The `tempo_get-attribute-names` tool accepts an optional `scope` parameter to filter attributes by their scope:
+
+| Scope | Returns | Use Case |
+|---|---|---|
+| `"span"` | Only span-level attributes | When investigating what span attributes exist (span.http.method, span.db.statement) |
+| `"resource"` | Only resource-level attributes | When discovering service/deployment attributes (resource.service.name, resource.deployment.environment) |
+| `"event"` | Only event attributes | When analyzing events within traces |
+| `"link"` | Only link attributes | When inspecting trace links |
+| `"instrumentation"` | Only instrumentation attributes | When exploring SDK/library information |
+| (omitted) | All attributes from all scopes | When doing broad attribute discovery |
+
+**Example:**
+```
+❌ Too broad: tempo_get-attribute-names(datasourceUid="<uid>")
+→ Returns 100+ attributes from all scopes; hard to find what you need
+
+✅ Focused: tempo_get-attribute-names(datasourceUid="<uid>", scope="resource")
+→ Returns only resource attributes; quickly find resource.service.name, resource.deployment.environment, etc.
+```
+
+**Query Validation: All TraceQL Queries Are Parsed Before Execution**
+
+Tempo validates TraceQL syntax BEFORE sending queries to the backend. Malformed queries are rejected with helpful error messages:
+
+**Error for invalid TraceQL syntax:**
+```
+Error: "query parse error. Consult TraceQL docs tools: <error details>"
+```
+
+**When you see this error:**
+1. Check your TraceQL syntax (missing braces, invalid operators)
+2. Call `tempo_docs-traceql(datasourceUid="<uid>", name="basic")` for syntax reference
+3. Fix the syntax and retry
+
+**Error Handling (Tempo Tools):**
+
+| Error Case | Message Pattern | Root Cause | Resolution |
+|------------|---|---|---|
+| **Missing datasourceUid** | Contains "datasourceuid" + "required" | Parameter omitted from call | Always pass `datasourceUid=<uid>` to all tempo_* tools |
+| **Invalid datasourceUid** | Contains "not found" or "not accessible" | UID doesn't exist or isn't accessible | Use `list_datasources(type="tempo")` to verify available UIDs |
+| **Multiple Tempo datasources** | Error lists available UIDs | Ambiguous which Tempo to query | Be explicit: use correct UID matching environment (prod-tempo, staging-tempo, etc.) |
+
+**Example: Handling Missing datasourceUid**
+```
+❌ WRONG: tempo_traceql-search(query="{ resource.service.name=\"api\" }", limit=10)
+✅ RIGHT: tempo_traceql-search(datasourceUid="prod-tempo", query="{ resource.service.name=\"api\" }", limit=10)
+```
+
+**MCP Discovery & Architecture (Internal, Not User-Facing):**
+
+Tempo tools are discovered and registered per-user session via MCP (Model Context Protocol) proxying:
+
+1. **Per-Session Discovery:** When a user connects, all configured Tempo datasources are discovered.
+2. **Per-Datasource Tools:** For each discovered Tempo datasource, its full tool list is fetched and registered with `datasourceUid` parameter automatically injected.
+3. **Tool Registration:** Tools appear in tool list as `tempo_<tool_name>`, identical across datasources. At runtime, `datasourceUid` parameter routes execution to correct datasource.
+4. **Session Isolation:** Each user session maintains separate state. Concurrent requests are thread-safe via sync.Once pattern (discovery runs exactly once per session).
+5. **No Double-Discovery:** MCP discovery is cached per-session (protected by sync.Once), preventing redundant remote calls even with 100+ concurrent tool requests.
 
 ### Utility — Deeplinks
-- `generate_deeplink` — Create shareable links to Grafana resources (dashboard, panel, explore query). Supports time range injection.
+
+`generate_deeplink` — Create shareable links to Grafana resources for collaboration/sharing. **Always include time range** to provide investigation context.
+
+**Resource Types & Required Parameters:**
+
+| Resource Type | Required Params | Optional Params | Example Use Case |
+|---------------|-----------------|-----------------|------------------|
+| `dashboard` | `dashboardUID` | `TimeRange`, `QueryParams` | Share dashboard view within incident window |
+| `panel` | `dashboardUID`, `panelID` | `TimeRange`, `QueryParams` | Focus on specific visualization within dashboard |
+| `explore` | `datasourceUID` | `TimeRange`, `QueryParams` | Share PromQL/LogQL/TraceQL query for peer review |
+
+**Parameter Specification:**
+
+- **TimeRange**: Both `from` and `to` required. See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters) for accepted formats. Quick: relative (`"now-1h"`, `"now-24h"`) or absolute RFC3339 (`"2024-01-01T12:00:00Z"`).
+- **QueryParams**: Map of key-value pairs. Use `var-<name>` prefix for Grafana variables (e.g., `var-datasource`, `var-environment`). Values are URL-encoded automatically.
+- **DatasourceUID**: Required for explore; obtain from `list_datasources()`.
+- **DashboardUID**: Available from `search_dashboards()` results or dashboard URL.
+- **PanelID**: Integer panel ID from dashboard JSON; obtain from `get_dashboard_panel_queries()`.
+
+**Common Error Cases:**
+
+```
+ERROR: dashboardUid is required          → dashboard/panel missing dashboardUID
+ERROR: panelId is required               → panel missing panelID
+ERROR: datasourceUid is required         → explore missing datasourceUID
+ERROR: unsupported resource type         → resourceType not in [dashboard, panel, explore]
+ERROR: grafana url not configured        → Grafana base URL missing from config
+```
+
+**Workflow Pattern:**
+
+```
+1. Construct deeplink with TimeRange to provide investigation window context
+2. Include QueryParams for explore to embed your query
+3. Share URL with team for peer review/collaboration
+4. Example: After finding latency spike, generate explore link with your PromQL + time window
+```
+
+### Utility — Panel Query Execution (Dashboard-Based)
+
+`run_panel_query` — Execute queries directly from dashboard panels without manual reconstruction. Automatically substitutes Grafana macros and template variables. Returns per-panel results with datasource metadata and debugging hints.
+
+**When to use:** Verify pre-built dashboard queries match manual analysis, or rapidly execute multiple related queries from a known dashboard during investigation.
+
+**Key Parameters:**
+
+| Parameter | Type | Notes |
+|---|---|---|
+| `DashboardUID` | string | Dashboard UID (from search_dashboards) |
+| `PanelIDs` | []int | Panel IDs to execute (e.g., [1, 3, 5]; tool handles nested panels in rows automatically) |
+| `Start` | string | See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters). Quick: relative `"now-1h"` or absolute RFC3339 `"2024-01-15T10:00:00Z"`. |
+| `End` | string | See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters). Quick: relative `"now"` or absolute RFC3339. |
+| `Variables` | map[string]string | (optional) Override dashboard template variables |
+
+**Automatic Substitutions:**
+
+- **Grafana Temporal Macros:** `$__range` → "1h", `$__rate_interval` → "1m", `$__interval` → duration/100, `$__interval_ms` / `$__range_s` / `$__range_ms` → numeric forms. Substitution happens BEFORE backend query.
+- **Template Variables:** `$variable`, `${variable}`, `[[variable]]` formats all work. Skips "All" and "$__all" sentinels (unset variables).
+- **Datasource Resolution:** Target-level datasource overrides panel-level. Mixed datasource panels delegate to target level. Result includes actual DatasourceType queried.
+
+**Result Structure:** `RunPanelQueryResult` includes `TimeRange`, per-panel `Results` map (keyed by panel ID), and `Errors` array. Each panel result has: PanelID, PanelTitle, DatasourceType, DatasourceUID, Query (after substitution), Results array, Hints array (for empty results).
+
+**Special Cases:**
+
+- **CloudWatch:** Panels have no query string; instead RawTarget with structured fields (namespace, metricName, dimensions). Query field will be empty.
+- **Empty Results:** Tool auto-generates datasource-specific debugging hints. Empty results are NOT errors; use hints to troubleshoot (metric doesn't exist, time range has no data, variables unset).
+
+---
+
+## Time Format Reference (For All Backend Time Parameters)
+
+**Use this section as reference for ANY tool parameter accepting time values** (e.g., `startTime`, `endTime`, `startRfc3339`, `endRfc3339`, `start`, `end`).
+
+### Accepted Time Formats
+
+#### 1. Relative Times (Preferred)
+Format: `"now-<N><unit>"` where unit ∈ {h, m, d}
+
+| Example | Meaning | Use Case |
+|---------|---------|----------|
+| `"now"` | Current UTC time | End of time range for live queries |
+| `"now-1h"` | 1 hour ago | 1-hour window incident investigation |
+| `"now-30m"` | 30 minutes ago | Recent error spike analysis |
+| `"now-6h"` | 6 hours ago | Half-day trend analysis |
+| `"now-1d"` | 1 day ago | Daily comparison |
+
+**⚠️ Unconfirmed units:** `w` (weeks), `M` (months), `y` (years) — listed in some docs but NOT tested. Use h/m/d only unless you verify support.
+
+**❌ Invalid relative formats:**
+- Fractional durations: `"now-1.5h"` — not supported
+- Unrecognized units: `"now-1s"`, `"now-1y"` — not confirmed
+- Missing "now-" prefix: `"30m"`, `"1h"` — invalid
+
+#### 2. Absolute Times (RFC3339 with UTC)
+Format: `"YYYY-MM-DDTHH:MM:SSZ"` (Z suffix REQUIRED)
+
+| Example | Valid | Reason |
+|---------|-------|--------|
+| `"2024-01-15T10:00:00Z"` | ✅ | UTC timezone explicit; Z suffix present |
+| `"2024-01-15T10:00:00"` | ❌ | Missing Z suffix; timezone ambiguous |
+| `"2024-01-15T10:00:00+00:00"` | ❌ | Not tested; Z suffix preferred |
+
+#### 3. Empty String (When Optional)
+- Format: `""` (empty string)
+- Behavior: Valid for optional parameters; returns zero time (no query window)
+- Use case: Open-ended range queries or unset optional bounds
+
+### Invalid Formats (Summary)
+
+| Format | Status | Reason |
+|--------|--------|--------|
+| `"now-1.5h"` | ❌ Invalid | Fractional durations unsupported |
+| `"2024-01-15T10:00:00"` | ❌ Invalid | Missing Z suffix; ambiguous timezone |
+| `"yesterday"`, `"last-hour"` | ❌ Invalid | Natural language not supported |
+| `"1609459200"` | ❌ Invalid | Unix timestamps not supported |
+| `"now-1s"`, `"now-1w"`, `"now-1y"` | ⚠️ Unconfirmed | Only h, m, d confirmed; use only if verified |
+
+### Time Precision & Behavior
+
+| Aspect | Details |
+|--------|---------|
+| **Relative time precision** | ~5 second tolerance (system clock resolution) |
+| **Absolute time precision** | Exact to the second (RFC3339) |
+| **Backend rounding** | Some backends apply additional rounding (e.g., to scrape interval boundaries) |
+| **Start vs End parameters** | Both accept identical formats; both can be empty string |
+| **Typical usage pattern** | `startTime="now-1h", endTime="now"` (closed range) |
+
+### Common Patterns
+
+| Intent | Start | End | Notes |
+|--------|-------|-----|-------|
+| Last 1 hour (live) | `"now-1h"` | `"now"` | Standard incident investigation |
+| Last 30 minutes (live) | `"now-30m"` | `"now"` | Recent spike analysis |
+| Specific past window | `"2024-01-15T09:00:00Z"` | `"2024-01-15T10:00:00Z"` | Post-mortem analysis with exact times |
+| Daily comparison | `"now-1d"` | `"now"` | Trend analysis (today vs yesterday pattern) |
+| Open-ended (from beginning) | `""` | `"now"` | Full dataset from start to now |
 
 ---
 
@@ -468,7 +895,25 @@ Discovery order — try each backend that is available; use first successful res
     1. search_dashboards(query="<service_name>")        [prefer — find monitoring context]
     2. search_tempo_tag_values(attribute="resource.service.name")  [prefer — OTel standard]
     3. list_prometheus_label_values(labelName="job")    [fallback — Prometheus labels]
-    4. list_loki_label_values(labelName="service_name") [fallback — Loki labels]
+     4. list_loki_label_values(labelName="service_name") [fallback — Loki labels]
+
+⚠️ **CRITICAL Pagination Gotcha:** `list_prometheus_metric_names`, `list_prometheus_label_names`, and `list_prometheus_label_values` all have default limit parameters. If your discovery results seem incomplete (e.g., "job" label has only 3 values but you expect 10+), the limit may have truncated results. **Always check result count against expected scope, and re-query with higher limit if needed.** This is the same gotcha as `list_alert_rules(limit=100)` causing false negatives — a common source of investigation dead-ends.
+
+⚠️ **Tempo Query Type Mismatch (Common Error):** Confusing search queries with metrics queries leads to errors. **Remember:**
+- Looking for "traces where X happened"? → Use `tempo_traceql-search` with `{ filter syntax }`
+- Looking for "how many traces", "what percentage", "what's the 95th percentile"? → Use `tempo_traceql-metrics-instant` or `tempo_traceql-metrics-range` with aggregation functions (`count()`, `rate()`, `quantile()`)
+- Error message will guide you: "TraceQL metrics query received on search tool. Use tempo_traceql-metrics-instant instead" means you sent the wrong query type. Fix it and retry.
+
+⚠️ **Filter-Query Syntax (Tempo Attribute Values Tool):** The optional `filter-query` parameter on `tempo_get-attribute-values` has strict rules:
+- ❌ WRONG: `filter-query="{ service=\"api\" } { status=500 }"` (two spansets = invalid)
+- ❌ WRONG: `filter-query="{ service=\"api\" || service=\"web\" }"` (OR logic = invalid)
+- ✅ RIGHT: `filter-query="{ service=\"api\" && status=500 }"` (one spanset, && only)
+- Error message: "filter-query invalid. It can only have one spanset and only &&'ed conditions..." → Check your syntax and retry.
+
+⚠️ **Scope Parameter Reduces Attributes:** When using `tempo_get-attribute-names(scope="span")`, you will see ONLY span attributes, not resource/event attributes. If you're looking for a specific attribute and don't find it, try:
+1. Omit scope to see all attributes: `tempo_get-attribute-names(datasourceUid="<uid>")`
+2. Try different scopes: `"span"`, `"resource"`, `"event"`, `"link"`, `"instrumentation"`
+3. Double-check the attribute name in TraceQL docs via `tempo_docs-traceql(..., name="basic")`
 
 If search_dashboards returns matches: retrieve get_dashboard_summary + get_dashboard_panel_queries
 to understand service instrumentation (what metrics/traces/logs are being collected).
@@ -514,16 +959,70 @@ strictly sequential.
 #### Prometheus Workflow
     1. Resolve datasource UID [from Session State or list_datasources]
     2. list_prometheus_label_names → confirm label keys exist
-    3. list_prometheus_label_values(labelName="job") → find actual service value
-       [skip if service already in Session State]
-    4. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
+       Optional: use Matches to filter (e.g., restrict to job="prometheus" results)
+     3. list_prometheus_label_values(labelName="job") → find actual service value
+        Optional: use Matches with operators (=, !=, =~, !~) to narrow results
+        [skip if service already in Session State]
+
+#### Label Matcher Operators for Discovery & Queries
+
+When using `Matches` parameter in label discovery tools or constructing selectors in PromQL, use these operators:
+
+| Operator | Behavior | Use Case | Example |
+|---|---|---|---|
+| `=` | Exact string match | Find exact value | `{Name:"job", Type:"=", Value:"prometheus"}` |
+| `!=` | Not equal (exclude value) | Exclude specific instance | `{Name:"instance", Type:"!=", Value:"localhost"}` |
+| `=~` | Regex match (anchored) | Pattern matching | `{Name:"job", Type:"=~", Value:"^payment.*"}` |
+| `!~` | Not regex (exclude pattern) | Exclude pattern | `{Name:"cluster", Type:"!~", Value:"test.*"}` |
+
+**Selector combination logic:** Multiple Matches are AND-ed together. Example:
+```
+Matches=[
+  {Filters: [{Name: "job", Type: "=", Value: "api"}]},
+  {Filters: [{Name: "env", Type: "=", Value: "prod"}]}
+]
+Returns: labels where job=api AND env=prod
+```
+
+**Regex rules (same as PromQL Rule 4):**
+- Always anchor regex: `^prefix` or `suffix$` or `^exact$`
+- `=~"^payment"` — matches "payment-api", "payment-db" (good: prefix anchored)
+- `=~"error|timeout"` — matches "error" OR "timeout" (good: no wildcards)
+- `=~".*error.*"` — ANTI-PATTERN: unanchored, disables index optimization
+- Plain string in regex context `"payment"` — matches substring anywhere (avoid; use exact = instead)
+
+---
+
+     4. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
     5. Apply PromQL checklist (Appendix A) — rewrite non-compliant patterns
     6. Start with: up{job="<value>"} to confirm service exists [if checking existence]
-    7. query_prometheus(expr=..., startTime=..., endTime=...)
-    8. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=...) to share query
-    9. Analyze: trend, spike, anomaly
-    10. **Optional:** If needed for dashboard context → search_dashboards(query="<service>") 
-        and retrieve get_dashboard_panel_queries to understand instrumentation
+    7. **SELECT QUERY TYPE:**
+       - Instant query: single point-in-time value (e.g., "is service up now?")
+         query_prometheus(expr=..., startTime="now", QueryType="instant")
+       - Range query: time-series data (e.g., "error rate trend over 1h?")
+          query_prometheus(expr=..., startTime="now-1h", endTime="now", StepSeconds=60, QueryType="range")
+      8. **Time Format Rules:** See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters) section above. Briefly: use `"now-<N>h/m/d"` for relative times (preferred), `"YYYY-MM-DDTHH:MM:SSZ"` for absolute, or `""` for optional empty.
+      9. **Step Parameter (Range Queries Only):**
+         Formula: expected_samples ≈ (endTime − startTime) / step
+         Guidance: step ≥ scrape interval (usually 15s–60s); start with 60s, increase if too many samples
+     10. query_prometheus(expr=..., startTime=..., endTime=..., StepSeconds=..., QueryType=...)
+     11. **Handle Empty/NaN Results:**
+         - Empty matrix/vector: metric does NOT exist OR no data in time range
+         - All NaN values: query matches series but data is NaN (check selector)
+         - Hint: Regenerate with broader time range or relaxed selector if truly no data
+     12. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=<uid>, 
+         TimeRange={from:"<start>", to:"<end>"}, QueryParams={"expr": "<your_promql>"})
+         to share query with team for peer review
+     13. Analyze: trend, spike, anomaly
+     14. **Optional:** If needed for dashboard context → search_dashboards(query="<service>") 
+         and retrieve get_dashboard_panel_queries to understand instrumentation
+
+**Histogram Queries (Special Function):**
+    - Use: query_prometheus_histogram(metric="http_request_duration_seconds", percentile=95, labels="job=\"api\"", rateInterval="5m")
+    - Percentile: 0–100 (e.g., 50=p50, 95=p95, 99=p99). Internally converts to quantile (95/100=0.95).
+    - Labels format: "key=\"value\"" string (not a map); multiple: "job=\"api\",instance=\"localhost:9090\""
+    - RateInterval: time window for rate calculation (e.g., "5m"); required for counter-based histograms
+    - Returns: Histogram quantile result (time-series of latency values at percentile)
 
 #### Loki Workflow
     1. Resolve datasource UID
@@ -534,23 +1033,151 @@ strictly sequential.
     5. Apply LogQL checklist (Appendix B) — rewrite non-compliant patterns
     6. query_loki_stats({narrowest_selector}) — MANDATORY; if >1M entries, narrow first
     7. **Optional:** query_loki_patterns({selector}) to detect anomalies automatically
-    8. query_loki_logs(logql=..., limit=10, direction="backward")
-       Append: | line_format "{{.__line__}}" to minimise payload
-       Expand cautiously: 10 → 50 → 100
-    9. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=...) to share query
+     8. query_loki_logs(logql=..., limit=10, direction="backward")
+        Append: | line_format "{{.__line__}}" to minimise payload
+        Expand cautiously: 10 → 50 → 100
+     9. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=<uid>,
+        TimeRange={from:"<start>", to:"<end>"}, QueryParams={"logql": "<your_logql>"})
+        to share query for peer review
 
 #### Tempo Workflow
-    1. Resolve datasource UID
-    2. gf-*_tempo_get-attribute-values(name="resource.service.name") → confirm service
+    1. list_datasources(type="tempo") → resolve Tempo datasource UID
+    2. tempo_get-attribute-values(datasourceUid=<uid>, name="resource.service.name") → confirm service exists
     3. **Complete Query Planning (Step −0.5)** — classify intent, select function, document plan
-    4. Apply TraceQL checklist (Appendix C) — rewrite non-compliant patterns
-    5. Lead with: { resource.service.name="<svc>" && <condition> }
-       Latency: duration > 500ms | Errors: status = error | HTTP: span.http.status_code = 500
-    6. gf-*_tempo_traceql-search(query=..., limit=10, start=..., end=...)
-    7. For large datasets: | quantile_over_time(duration, 0.9) with(sample=true)
-    8. **Optional:** gf-*_tempo_get-trace(trace_id=...) for single-trace deep dive
-    9. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=...) to share query
-    10. **Optional:** gf-*_tempo_get-attribute-names(scope="span") to discover available span attributes
+    4. **Identify Query Type:** Is your goal to find specific traces OR to aggregate across traces?
+       - Find traces: Use `tempo_traceql-search` with filter syntax like `{ resource.service.name="<svc>" && <condition> }`
+       - Aggregate: Use `tempo_traceql-metrics-instant` or `tempo_traceql-metrics-range` with `count()`, `rate()`, `quantile()`, etc.
+    5. Apply TraceQL checklist (Appendix C) — rewrite non-compliant patterns
+    6. Construct query leading with service filter: `{ resource.service.name="<svc>" && <condition> }`
+       - Latency: `duration > 500ms` | Errors: `status = error` | HTTP: `span.http.status_code = 500`
+    7. Execute search query: tempo_traceql-search(datasourceUid=<uid>, query=..., limit=10, start=..., end=...)
+    8. For large datasets needing metrics: Use aggregation instead: tempo_traceql-metrics-instant(..., query="count() by(resource.service.name)")
+    9. **Optional:** tempo_get-trace(datasourceUid=<uid>, trace_id=...) for single-trace deep dive
+    10. **Optional:** generate_deeplink(resourceType="explore", datasourceUid=<uid>, TimeRange={from:"<start>", to:"<end>"}, QueryParams={"traceql": "<your_traceql>"}) to share query for peer review
+    11. **Optional:** tempo_get-attribute-names(datasourceUid=<uid>, scope="span") to discover available span attributes (omit scope to see all)
+
+    **Multi-Datasource Pattern (Investigate Multiple Environments):**
+    - Resolve UIDs: list_datasources(type="tempo") → get ["prod-tempo", "staging-tempo", ...]
+    - Run identical queries against each: Same tool calls, different datasourceUid values
+    - Example: tempo_traceql-search(datasourceUid="prod-tempo", ...) vs tempo_traceql-search(datasourceUid="staging-tempo", ...)
+    - Use case: Compare latency/error rates across environments in single investigation
+
+#### Alternative: Execute Dashboard Panel Queries Directly
+
+**When to use:** Verify dashboard queries match manual hypotheses, or quickly run pre-built queries from known dashboards (faster than manual reconstruction).
+
+**Use case:** User provides dashboard name + service context. Instead of rebuilding queries, fetch + execute them directly.
+
+**Pattern:**
+
+    1. search_dashboards(query="<service_name>") → find dashboard UID
+    2. get_dashboard_summary(uid=...) → verify panels exist
+    3. Identify relevant panel IDs (e.g., "Error Rate", "Latency")
+    4. run_panel_query(DashboardUID=..., PanelIDs=[...], Start=..., End=...)
+    5. Returns: per-panel results with substituted macros, datasource types, queries executed
+
+**Key Behaviors:**
+
+- **Macro Substitution (Automatic):** Before execution, tool substitutes Grafana temporal macros:
+  - `$__range` → time range duration (e.g., "1h", "30m") [**critical for Loki metric queries**)
+  - `${__range}` → same (braced variant)
+  - `$__rate_interval` → fixed 1m (for rate() aggregations)
+  - `$__interval` → (endTime - startTime) / 100; minimum 1s floor
+  - `$__interval_ms` / `$__range_s` / `$__range_ms` → numeric equivalents
+  - Macros are replaced BEFORE query hits backend, so backend sees proper syntax
+
+- **Template Variable Substitution:** Dashboard variables (from `dashboard.templating.list`) are also substituted:
+  - Formats: `$variable`, `${variable}`, `[[variable]]` all work
+  - Skips "All" / "$__all" sentinel values (represents unset)
+  - Takes first value if array (multi-select)
+  - Substitution applies to both query strings AND structured CloudWatch targets
+
+- **Datasource Resolution:** Target-level datasource OVERRIDES panel-level datasource.
+  - Mixed datasource panels (`panel.datasource.uid = "-- Mixed --"`) delegate to target level
+  - Always check result.DatasourceType to confirm which backend was actually queried
+
+- **Nested Panels:** Recursively finds panels in rows. Use standard panel IDs (tool handles nesting automatically).
+
+- **CloudWatch Special Case:** CloudWatch panels have no query string; instead have structured fields (namespace, metricName, dimensions). Tool returns `RawTarget` instead of `Query`. Hints will reference CloudWatch-specific debugging (table schema, etc.).
+
+**Parameters:**
+
+| Parameter | Type | Required | Notes |
+|---|---|---|---|
+| DashboardUID | string | yes | From search_dashboards or known UID |
+| PanelIDs | []int | yes | Panel IDs to execute (e.g., [1, 3, 5]) |
+| Start | string | yes | See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters). Quick: relative like `"now-1h"`, `"now-30m"`, or absolute RFC3339. |
+| End | string | yes | See [Time Format Reference](#time-format-reference-for-all-backend-time-parameters). Quick: relative like `"now"` or absolute RFC3339. |
+| Variables | map[string]string | no | Additional dashboard variable overrides (overrides dashboard.templating.list values) |
+
+**Result Structure:**
+
+```
+RunPanelQueryResult {
+  DashboardUID: "payment-service-overview",
+  TimeRange: {Start: "now-1h", End: "now"},
+  Results: {
+    1: {  // Panel ID as key
+      PanelID: 1,
+      PanelTitle: "Error Rate",
+      DatasourceType: "prometheus",
+      DatasourceUID: "<datasource-uid>",
+      Query: "rate(http_errors_total{job=\"<service-name>\"}[1m])",  // After macro substitution
+      Results: [...],  // Backend result array
+      Hints: [...]     // Debugging hints if empty
+    },
+    4: {
+      PanelID: 4,
+      PanelTitle: "CloudWatch CPU",
+      DatasourceType: "cloudwatch",
+      DatasourceUID: "<datasource-uid>",
+      Query: "",  // Empty for CloudWatch
+      RawTarget: {  // Structured instead
+        "namespace": "AWS/ECS",
+        "metricName": "CPUUtilization",
+        "dimensions": {...}
+      },
+      Results: [...]
+    }
+  },
+  Errors: []  // Per-panel error messages if any failed
+}
+```
+
+**Empty Result Handling (NOT an error):**
+
+Tool auto-generates per-datasource hints when results are empty:
+
+- **Prometheus:** Suggests `list_prometheus_metric_names` to verify metric exists, check label selectors, widen time range
+- **Loki:** Suggests `query_loki_stats` to check volume, verify label names/values, check time range
+- **CloudWatch:** Suggests `describe_clickhouse_table` equivalent, verify metric namespace/name exist
+
+Use hints for troubleshooting. Empty results often mean:
+- Time range has no data (check Start/End)
+- Metric doesn't exist (use suggestions to verify)
+- Dashboard template variables are unset (check Variables parameter)
+
+**Example:**
+
+```
+Dashboard: "Service Overview" (uid="<service-dashboard-uid>")
+Panels: [1="Error Rate (1m)", 4="DB Connections"]
+Query: run_panel_query(
+  DashboardUID="<service-dashboard-uid>",
+  PanelIDs=[1, 4],
+  Start="now-1h",
+  End="now",
+  Variables={}
+)
+
+Response:
+- Panel 1 (Prometheus): "<error-rate>% error rate" — macro $__range was substituted to "1h", query executed as rate(...)
+- Panel 4 (Prometheus): "<connections>/<max> connections" — confirms pool near limit
+
+Conclusion: Matches hypothesis. Dashboard confirms error rate spike + pool exhaustion.
+```
+
+---
 
 **After each backend:**
 - Extract 1–5 key findings.
@@ -675,11 +1302,13 @@ Service names differ by backend due to labeling conventions:
 
 **Grafana-Specific Violations:**
 - Skipped list_alert_rules or get_annotations (Tier 0 signals) — even if you believe alerts won't fire for the symptom
+- **Used default `limit=100` on list_alert_rules** — concluded "no firing alerts" without seeing all rules. ALWAYS use `limit=1000+` when checking alert states.
+- **Attempted to filter alerts by `state` using `label_selectors`** — state is a response field, not a label. `label_selectors` filters by alert labels (severity, job, etc.), not by state. This returns `[]`. Always fetch all rules and filter by state client-side.
 - Did NOT search_dashboards for service discovery — attempted metric query without first checking instrumentation
 - Queried backend without dashboard context of instrumentation (e.g., "I'll find the metric first, then check dashboard")
 - No service mapping across multiple backends — skipped discovery because "service name looks obvious"
-- Queried Tempo/Loki without gf-*_tempo_get-attribute-values or list_loki_label_values first
-- Used old tool names (search_tempo_tags, query_tempo) instead of gf-*_tempo_* variants
+- Queried Tempo/Loki without tempo_get-attribute-values or list_loki_label_values first
+- Called Tempo tools WITHOUT datasourceUid parameter — all 7 tools require it (datasourceUid is required, string, camelCase)
 - Justified skipping alerts by reasoning "alerts only fire on threshold breaches, not gradual issues"
 - Justified skipping dashboards by reasoning "I'll query metrics directly and verify instrumentation later"
 - Justified skipping annotations by reasoning "symptom doesn't look like deployment, so no annotations relevant"
@@ -724,25 +1353,26 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
 - [ ] Stats check completed before high-volume retrieval (Loki, Tempo)
 - [ ] Findings from previous backend documented before querying next
 - [ ] Stop condition checked
-- [ ] **Optional:** generate_deeplink created for shareable context
+- [ ] **Optional:** generate_deeplink(resourceType="explore", datasourceUid=<uid>, 
+  TimeRange={from:"<window_start>", to:"<window_end>"}, QueryParams={...query...}) 
+  created for shareable context; include time window to provide investigation scope
 
 ---
 
 ## Quick-Reference Example
 
-**User:** `@rca payment-processor errors spiked at 14:32 UTC`
+**User:** `@rca <service-name> errors spiked at <incident-time> UTC`
 
 **Step −1:** INVESTIGATE mode. Expert user (service + time provided).
-**Step 0:** Window: 14:15–14:50 UTC. *(reuse if in Session State)*
+**Step 0:** Window: <incident-time-minus-15m>–<incident-time-plus-20m> UTC. *(reuse if in Session State)*
 **Step 0.5:** 
-    1. list_alert_rules(datasourceUid=..., state=firing) → `PaymentHighErrorRate FIRING since 14:32`.
-       Alert labels: `job=payment-processor-prod, severity=critical`.
-    2. get_annotations(From=14:15 UTC, To=14:50 UTC) → deployment marker at 14:30 UTC found.
+    1. list_alert_rules(datasourceUid=..., limit=1000) → Filter by state="firing" → Find alert matching service. Check alert labels for service identifier.
+    2. get_annotations(From=<start_time_ms>, To=<end_time_ms>) → deployment marker around incident time found. Correlate with alert timing.
        Alerts + annotations directly explain symptom timing.
 **Step 1:** Alert + annotation confirms error spike + deployment timing. Fast-path: skip to root cause evidence.
-**Step 2:** Prometheus job = "payment-processor-prod" *(from alert labels — no discovery call needed)*
-           search_dashboards("payment-processor") → dashboard "Payment Service Overview" found
-           get_dashboard_summary(...) → 12 panels, includes database connection metrics
+**Step 2:** Service identifier from alert labels *(no discovery call needed)*
+           search_dashboards("<service-name>") → dashboard found
+           get_dashboard_summary(...) → panels include key metrics
 **Step −0.5 (Query Planning):** Before querying error rate:
     ```
     Backend: Prometheus
@@ -753,19 +1383,21 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
     Anti-pattern check: ❌ NOT using increase() / time
     ```
 **Step 4 (Tier 2):** PromQL checklist ✓
-    query_prometheus(expr="rate(http_errors_total{job=\"payment-processor-prod\"}[5m])", startTime="14:32 UTC")
-    → 12% error rate from 14:32. DB connection metric:
-    query_prometheus(expr="postgres_connections_used{job=\"payment-processor-prod\"}", startTime="14:32 UTC")
-    → 248/250 at 14:32 — connection pool exhausted.
-    generate_deeplink(resourceType="explore", datasourceUid=..., queryParams={expr="..."})
-    → Share dashboard context + queries with team
-**Step 5:** Root cause found. Stop. Known failure pattern: "connection pool".
+    query_prometheus(expr="rate(http_errors_total{job=\"<service-identifier>\"}[5m])", startTime="<incident-time>")
+     → Error rate spike observed. Additional metric check:
+     query_prometheus(expr="<metric-name>{job=\"<service-identifier>\"}", startTime="<incident-time>")
+     → Resource exhaustion detected — correlates with deployment.
+     generate_deeplink(resourceType="explore", datasourceUid="<prometheus-uid>", 
+                       TimeRange={from:"<start_time>", to:"<end_time>"},
+                       QueryParams={expr:"rate(http_errors_total{job=\"<service-identifier>\"}[5m])"})
+     → Share Prometheus query + time window with team for peer review
+**Step 5:** Root cause found. Stop. 
 **Step 8 (TRIAGE):**
-    🔴 payment-processor-prod: 12% error rate from 14:32 UTC.
-    Root cause: PostgreSQL connection pool exhausted (248/250) — correlates with 14:30 UTC deployment.
-    Context: Dashboard "Payment Service Overview" shows 12 instrumented metrics; connection pool was not monitored before.
-    Immediate: restart service to free connections; check for missing connection.close().
-    Preventative: alert on pool utilisation >80%; add connection timeout + pool size metric to dashboard.
+    🔴 <service-name>: Error spike from <incident-time> UTC.
+    Root cause: Resource exhaustion — correlates with <time-of-deployment> UTC deployment.
+    Context: Dashboard "<service-name>" shows key instrumented metrics.
+    Immediate: Review deployment changes; check service logs for resource-related errors.
+    Preventative: Add resource utilization alerts; improve pre-deployment load testing.
 
 ---
 
@@ -777,6 +1409,9 @@ Any of these → STOP. Re-read constraints. Restart from Step 1.
 **Rule 2 — Most selective exact-match labels first** in every selector.
 **Rule 3 — Prefer exact match over regex** (= over =~; anchored alternation =~"a|b" is acceptable).
 **Rule 4 — Always anchor regex** — never lead with .*word (suffix matching kills index).
+   - ✅ Good patterns: `=~"^prometheus"` (prefix), `=~"error$"` (suffix), `=~"^api|^gateway$"` (anchored alternation)
+   - ✅ Acceptable: `=~"api"` when semantics allow unanchored (e.g., selecting all "api-*" variants and no false matches)
+   - ❌ Anti-patterns: `=~".*prometheus.*"` (leading wildcard), `=~"prom"` (floating, disables index), `=~"(?i)error"` (case-insensitive regex — use exact match instead)
 **Rule 5 — Minimize time range; maximize step interval** (step ≥ scrape interval always).
 **Rule 6 — Avoid aggregating by high-cardinality labels** (user_id, request_id, trace_id).
 **Rule 7 — Avoid subqueries** — use recording rules instead.
