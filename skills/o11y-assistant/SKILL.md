@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.11
+version: 0.12
 description: >
   Use when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying observability backends (Prometheus/Mimir,
@@ -9,16 +9,6 @@ description: >
 ---
 
 # O11y Assistant — Unified Observability Investigation
-
-## Runtime Environment (OSS LGTM Stack Only)
-
-- Grafana OSS
-- Loki OSS
-- Tempo OSS (vParquet4/vParquet5, Tempo 2.10+)
-- Mimir 3.0+ (MQE default) or Prometheus
-
-Grafana Cloud SaaS features MUST NOT be used:
-no Sift, no Adaptive Metrics, no Cloud Alerting, no ML anomaly detection.
 
 ---
 
@@ -279,6 +269,222 @@ turns — do NOT re-discover what is already known:
     ─────────────────────────────────────────────────────
     Only re-call list_datasources or datetime_get_current_time if these are
     unknown or the user provides a new time reference.
+
+---
+
+## Step −0.6: Four-Gate Cardinality Validation (MANDATORY for COUNT/TOTAL Queries)
+
+**APPLIES TO:** Any query intent where user asks "how many" or "total count" of something (nodes, services, requests, events, pods, etc.).
+
+**WHY:** Cardinality confusion is the most common root cause of incorrect observability conclusions. Every backend multiplies raw units through hidden cardinality ratios:
+- **Prometheus:** 1 node might = 3 time series (different scrape endpoints)
+- **Loki:** 1 error event might = 2-5 log lines (retries, streams, different pods)
+- **Tempo:** 1 request might = 5-15 spans (service call depth)
+
+Without validating cardinality, you report raw units as entities and get answers that are plausible but wrong.
+
+### The Four Gates (Apply in Order)
+
+#### Gate 1: Semantic Entity Definition
+**Before querying, define explicitly (WRITE THIS DOWN):**
+- What entity are you measuring? (node, service, pod, request, error, user, etc.)
+- What does the backend measure natively? (raw unit: time series, log line, span)
+- Why is the cardinality ratio 1:N? (document the mechanism)
+
+**Example:**
+```
+User asks: "How many nodes are running?"
+
+Gate 1 Definition:
+Entity:              Kubernetes node (cluster member)
+Backend raw unit:    Prometheus metric instance (kube_node_info)
+Cardinality model:   1 metric per node (assuming 1:1 relationship)
+Assumption:          kube_node_info == "one instance per node"
+```
+
+**❌ LOOPHOLE ALERT — Rationalization Pattern #1:** "I'll define it implicitly as I go."
+- This is where the RED phase fails. You'll skip writing down assumptions and catch contradictions too late.
+- **Enforce:** Write the definition in the format above BEFORE ANY QUERIES.
+
+**❌ DO NOT SKIP:** Stating the assumption explicitly prevents blind spots. If cardinality is actually 3:1, this gate catches it when you verify.
+
+---
+
+#### Gate 2: Cardinality Discovery (Sample Before Total)
+**MANDATORY: Never report totals without sampling cardinality first.**
+
+**🔴 LOOPHOLE ALERT — Rationalization Pattern #2:** "I've queried Prometheus and Prometheus before; both returned the same metric family. I can trust the count."
+- This is the most dangerous rationalization. Both queries use the SAME cardinality model.
+- **Example:** If you query `count(kube_node_info)` and then `count(count by(node) (kube_node_status))`, both measure the same semantic unit through Kubernetes State Metrics. A bug in KSM affects both equally.
+- **Enforce:** You MUST sample raw data from at least one query to see the actual label structure and verify your assumption about cardinality.
+
+**Process:**
+1. Execute discovery query to see **sample of raw data** (not aggregated)
+2. Inspect labels/structure to understand what one raw unit looks like
+3. Count distinct raw units for ONE "entity" label value (e.g., one node)
+4. Document the observed cardinality ratio
+
+**Example (Prometheus):**
+```
+User intent: Count nodes
+Query: kube_node_info (raw metric instances, not aggregated)
+Result: 14 instances, each with unique kube_node_info label
+Cardinality observed: 1 metric per node ✓
+Ratio: 1:1
+
+[Compare to alternative:]
+Query: kubelet_* metrics for same time
+Result: 42 metric instances matching kubelet pattern
+Cardinality analysis: 42 ÷ 14 = 3:1 ratio (3 kubelet metrics per node)
+Conclusion: kube_node_info is correct source; kubelet metrics are overcount
+```
+
+**Example (Loki):**
+```
+User intent: Count error events
+Query: query_loki_stats({job="api"} |= "error")
+Result: 2,847 log entries in time window
+Query: query_loki_logs({job="api"} |= "error", limit=10)
+Result: Sample shows pod_id, stream_id, retry_count labels
+Cardinality analysis: Same error event spans 3-5 log lines (Pod A retries)
+Observed ratio: 1 error event ≈ 3-4 log lines
+```
+
+**Red Flags at Gate 2:**
+- ❌ Reporting total without sampling (e.g., "count() = 42" without seeing raw units)
+- ❌ Mixing multiple cardinality models (e.g., both kubelet metrics AND kube_node_info for same entity)
+- ❌ Assuming 1:1 cardinality without checking
+- ❌ "Two Prometheus queries agree, so I'll skip Gate 2" (CRITICAL: you're checking two instances of the same cardinality model)
+
+---
+
+#### Gate 3: Measurement Translation
+**Convert raw units back to entities using discovered ratio. WRITE OUT THE MATH.**
+
+**🔴 LOOPHOLE ALERT — Rationalization Pattern #3:** "I know the answer is 14, so I don't need to show the calculation."
+- This is where the GREEN phase catches conflicts. If you don't write the division, you can't reconcile when different sources disagree.
+- **Enforce:** Always write: `Entity count = (Raw count) ÷ (Observed ratio) = Final answer`
+
+**Pattern:**
+```
+Entity count = (Raw unit count) ÷ (Observed cardinality ratio)
+```
+
+**MANDATORY documentation format:**
+```
+Gate 3 Translation:
+Raw count:              [from Gate 2]
+Observed ratio:         [from Gate 2]
+Calculation:            [raw] ÷ [ratio] = [entity count]
+Final answer:           [number] [entity type]
+Verification:           Does [entity count] match initial expectations? Yes/No + explanation
+```
+
+**Example (Prometheus):**
+```
+Gate 3 Translation:
+Raw query result:    count(kube_node_info) = 14
+Observed ratio:      1 metric per node (from Gate 2)
+Calculation:         14 ÷ 1 = 14 nodes
+Final answer:        14 nodes ✓
+Verification:        Matches expected cluster size from deployment manifest
+
+[Contrast with wrong approach:]
+Raw query result:    count(kubelet_*) = 42
+Observed ratio:      NOT DISCOVERED (skipped Gate 2)
+Calculation:         "I'll report 42 as the answer" ❌
+Final answer:        42 nodes (WRONG)
+```
+
+**Documentation requirement:** Show the division/translation explicitly. If anyone later questions the answer, they see the working.
+
+---
+
+#### Gate 4: Cross-Backend Validation (MANDATORY — Do Not Rationalize Away)
+**If multiple backends available: reconcile answers BEFORE reporting.**
+
+**🔴 LOOPHOLE ALERT — Rationalization Pattern #4:** "Loki doesn't have node-level labels, so I can't validate. I'll skip Gate 4."
+- **DO NOT.** Gate 4 doesn't require that one backend perfectly mirrors the other. It requires you to:
+  1. Discover what backends are available (list_datasources)
+  2. Attempt to answer the same question in each one
+  3. If a backend can't answer the question exactly, document WHY and whether it provides supporting evidence
+  4. Reconcile or note conflicts
+
+- **Enforce:** ALWAYS check `list_datasources` ONCE per session to see what backends you have. Then attempt Gate 4 with every available backend, documenting whether it succeeded, partially matched, or couldn't apply.
+
+**Process:**
+1. List available datasources: Prometheus, Loki, Tempo
+2. For each available backend: attempt to answer the same COUNT question
+3. Apply Gates 1–3 for each backend
+4. Compare final entity counts
+5. If different: STOP and investigate WHY before reporting
+
+**Example (Full Reconciliation):**
+```
+GATE 4 Setup:
+Available backends: Prometheus, Loki, Tempo
+Question: How many nodes?
+
+Prometheus Result (Gate 3 translation):    14 nodes (from kube_node_info)
+Loki Attempt:                              Cannot answer directly (no node-level logs)
+                                           Supporting evidence: kubelet logs show 14 unique pod hosts ✓
+Tempo Attempt:                             Cannot answer directly (no node-level spans)
+                                           Skipped: not applicable for infrastructure count
+
+Reconciliation:
+Prometheus authoritative:     14 nodes ✓
+Loki supporting evidence:     14 unique hosts in kubelet logs ✓
+Tempo:                        N/A (traces don't measure infrastructure)
+Final answer:                 14 nodes ✓ (confirmed by 2 backends)
+```
+
+**Example (Conflict Scenario):**
+```
+GATE 4 Setup:
+Available backends: Prometheus, Loki
+Question: How many nodes?
+
+Prometheus Result (Gate 3):    14 nodes (kubelet metrics)
+Loki Result (Gate 3):          20 log-producing entities (from log source labels)
+                               Applied Gate 2: Filtered to only "kubelet" service → 14 log sources ✓
+
+Reconciliation:
+Raw conflict:                   14 (Prometheus) vs 20 (Loki) before filtering
+After applying Gate 2 to Loki:  14 (Loki kubelet logs) vs 14 (Prometheus kubelet)
+Resolution:                     Loki counted 6 non-kubelet log sources initially
+Final answer:                   14 nodes ✓ (Prometheus + filtered Loki match)
+```
+
+**Stopping rule:** If 2+ backends show CONFLICTING RESULTS **after translation**, DO NOT report any number. Investigate the conflict first.
+
+**"Cannot apply" is NOT Skip:**
+- ✅ Loki cannot answer "how many nodes" directly, but can provide supporting evidence → Document and use if consistent
+- ❌ "Loki doesn't have the data, so I'll skip Gate 4" → WRONG. You still must document the attempt and why it failed
+
+---
+
+### Cardinality Validation Checklist (Apply for Every COUNT Query)
+
+Before reporting any count/total/number:
+
+- [ ] **Gate 1 WRITTEN:** Entity definition in standard format (not mental)
+- [ ] **Gate 1 WRITTEN:** Backend raw unit identified and documented
+- [ ] **Gate 1 WRITTEN:** Cardinality model explained (mechanism, not assumption)
+- [ ] **Gate 2 EXECUTED:** Sample of raw data retrieved (not aggregated count)
+- [ ] **Gate 2 DOCUMENTED:** Cardinality ratio observed and calculated from actual data
+- [ ] **Gate 2 VERIFIED:** Checked for mixing cardinality models (not comparing two same-backend queries)
+- [ ] **Gate 3 WRITTEN:** Translation calculation shown: (raw count) ÷ (ratio) = entity count
+- [ ] **Gate 3 VERIFIED:** Final reported answer matches translation result exactly
+- [ ] **Gate 4 ATTEMPTED:** Listed available backends from list_datasources
+- [ ] **Gate 4 ATTEMPTED:** Attempted same question in each available backend (document why if "N/A")
+- [ ] **Gate 4 RECONCILED:** Conflicting results investigated (not ignored/rationalized away)
+- [ ] **Gate 4 FINAL:** All backends report consistent entity count (or documented why one is authoritative)
+
+**Failure pattern red flags:**
+- ❌ "Gate 1 YES, Gate 2 SKIP" — "Two queries agree" is NOT cardinality validation
+- ❌ "Gate 4 SKIP" — "Loki doesn't have the data" is NOT a valid skip; document and find supporting evidence instead
+- ❌ Gates 1–3 not written down — Mental execution allows rationalization to hide
+- ❌ "Final answer: 42" without showing "42 ÷ [ratio] = [entity count]" — Translation step invisible
 
 ---
 
