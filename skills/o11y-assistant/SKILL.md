@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.34
+version: 0.35
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -19,6 +19,10 @@ description: >
 - Service name cannot be resolved after 3 discovery attempts
 - ALL available backends have been queried with no findings
 - Evidence directly contradicts itself and you cannot determine which is correct
+
+**Flags (user can invoke at any point in conversation):**
+- `--history` → Load `resolutions/<service>.md` (relative to this skill). Resolve `<service>` from prompt or Session State. If service unknown, defer until after Step 2 discovery.
+- `--record` → After investigation, append resolution to `resolutions/<service>.md` using the resolved service name from Session State. Check for novelty first.
 
 ## Core Principle
 
@@ -68,6 +72,8 @@ Time context:      current_utc=<ts>  investigation_window=<start>–<end>
 Severity:          [LOW|MEDIUM|HIGH|CRITICAL]
 ─────────────────────────────────────────────────────
 ```
+
+**Follow-up in same conversation:** Reuse Session State. Skip Steps 0–0.5 unless user changes service or time window. Resume from Step 1 with new symptom/hypothesis.
 
 ---
 
@@ -318,9 +324,10 @@ For past-incident queries: set window around incident time ±15 min.
 2. **Parallel calls (both safe):**
    - `list_alert_rules(datasourceUid=..., limit=1000)` → Filter by `state="firing"` (client-side)
    - `get_annotations(From=<start_ms>, To=<end_ms>)` → deployment markers, maintenance windows
-3. Note severity impression: `Severity: [LOW/MEDIUM/HIGH/CRITICAL]` (from alert state + blast radius). Store in Session State.
+3. **Alert quality check:** Weigh recently-transitioned `firing` alerts higher than long-standing or high-frequency alerts. Check `for` duration — a `1m` alert fires on noise, a `15m` alert fires on sustained issues.
+4. Note severity impression: `Severity: [LOW/MEDIUM/HIGH/CRITICAL]` (from alert state + blast radius). Store in Session State.
 
-4. **Decision:**
+5. **Decision:**
    - Firing alerts found? → Correlate with symptoms. Use alert labels as service discovery seed. If alerts fully explain symptom → Step 8 (TRIAGE).
    - No alerts? → Check annotations; proceed to Step 1.
 
@@ -332,6 +339,7 @@ For past-incident queries: set window around incident time ±15 min.
 - Form 2–3 hypotheses that could explain the symptom — **include at least one non-obvious cause** (e.g., not just "the service is broken" but "an upstream dependency changed behavior") → **add to Hypothesis Tracker**
 - State chosen investigation sequence: "Starting with Metrics (latency issue). If inconclusive → Traces."
 - **Ask yourself:** "If my first hypothesis is wrong, what would the evidence look like?" — this shapes what to query.
+- **`--history` active?** Load `resolutions/<service>.md` (service name from prompt or Session State; if resolved after Step 2, revisit hypotheses with history before Step 3). Add most recent historical pattern as hypothesis. MUST also form at least 1 hypothesis that contradicts it ("what if it's NOT [past cause]?"). Check past **blind spots** as hypothesis seeds. History informs — never shortcuts discovery.
 
 ### Step 2: Service Discovery (Once — Reuse Everywhere)
 
@@ -389,7 +397,9 @@ Service mapping:
 
 #### Backend-Specific Notes
 
-**Prometheus:** Start with `up{job="<svc>"}` to confirm service exists. Step ≥ scrape interval (start with 60s). Use `query_prometheus_histogram` for percentiles.
+**Prometheus:** Start with `up{job="<svc>"}` to confirm service exists. Step ≥ scrape interval (start with 60s). Use `query_prometheus_histogram` for percentiles. **Baseline:** For key metrics, compare across two horizons:
+- **Trend** (is it worsening?): `offset 5m` → `offset 15m` → `offset 45m` — shows direction within the incident
+- **Seasonal baseline** (is this abnormal?): `offset 7d` / `offset 14d` — same day-of-week comparison. Avoid `offset 1d` (weekend/weekday seasonality misleads).
 
 **Loki:** `query_loki_stats` MANDATORY before broad pulls (>1M entries → narrow first). Start limit=10, expand cautiously. Direction: "backward" (newest first) for recent events.
 
@@ -401,7 +411,12 @@ Service mapping:
 - **Critical check:** Does this evidence actually *explain* the symptom, or does it just *correlate*? What's the strongest counter-argument to the leading hypothesis?
 - Update/confirm/refute hypotheses. **If all hypotheses are ACTIVE after 2+ queries — your hypotheses may be wrong. Step back and form new ones.**
 - If 3 consecutive empty results → re-examine service name (wrong label? wrong time window?)
-- If anomaly found but causal validation (Step 4.5) returns SYMPTOM → identify upstream service from traces/logs → pivot investigation to that service
+- If anomaly found but causal validation (Step 4.5) returns SYMPTOM → **discover upstream dependency:**
+  1. `list_prometheus_metric_names(regex="span.*metric|trace.*")` → if found, query relationship labels (`peer.service`, `server`, `client`) filtered by target service → dependency list
+  2. No spanmetrics → `tempo_traceql-search({ resource.service.name="<svc>" }, limit=3)` → `tempo_get-trace` for each → extract unique `resource.service.name` from child spans
+  3. Logs: check error messages for failing service/host names (e.g., "connection refused to auth-service:8080")
+  Store discovered deps in Session State. Note: async/infrequent dependencies may not appear.
+  → Pivot investigation to most likely upstream service
 - **Root cause found → Step 4.5 → Step 8. Inconclusive → Step 5.**
 
 ### Step 4.5: Causal Reasoning Protocol
@@ -496,6 +511,14 @@ Ruled out: [hypotheses tested]
 ```
 
 **RULE:** Never directly trigger destructive actions (rollbacks, deletions). Always require human confirmation.
+
+**`--record` active?** Append to `resolutions/<service>.md` (create dir + file if first time). Before appending, read existing entries — **only record if this investigation reveals a novel root cause, key finding, or blind spot** not already captured. Skip if duplicate.
+```
+## [UTC timestamp] | [symptom ≤5 words]
+- **Root cause:** [1 sentence + evidence grade]
+- **Key finding:** [non-obvious insight]
+- **Blind spot:** [what wasn't checked or available]
+```
 
 ---
 
