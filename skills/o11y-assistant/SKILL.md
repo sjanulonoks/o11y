@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.36
+version: 0.37
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -113,6 +113,7 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | No blind queries | Always discover labels before constructing queries. |
 | Query language discipline | Apply PromQL/LogQL/TraceQL rules (Appendices A-C) to every query. |
 | Query budget | ~10 analytical queries max. Budget exhausted → present findings as-is (Step 8). |
+| Dependency direction | **Upstream** = services this service receives requests FROM (callers). **Downstream** = services this service sends requests TO (callees). |
 
 ### Parallelism Policy
 
@@ -341,6 +342,7 @@ For past-incident queries: set window around incident time ±15 min.
 - State chosen investigation sequence: "Starting with Metrics (latency issue). If inconclusive → Traces."
 - **Ask yourself:** "If my first hypothesis is wrong, what would the evidence look like?" — this shapes what to query.
 - **`--history` active?** Load `resolutions/<service>.md`. If file has a `## Distilled Patterns` section (written by `--review`), use patterns directly. Otherwise scan most recent 5 entries. Add most recent historical root cause as hypothesis. MUST form >=1 contradicting hypothesis ("what if it's NOT [past cause]?"). Past **blind spots** and **user corrections** are highest-priority hypothesis seeds. If service unknown pre-Step 2, defer: set `history_pending=true` in Session State, load after Step 2 resolves service name. History informs — never shortcuts discovery. @see library/history.md
+- **Dependency signal check:** If ANY present → set `dependency_probe=true` in Session State: (1) user mentions upstream/downstream/cascading/dependency or names multiple services, (2) cross-service alerts firing in Step 0.5, (3) --history shows past multi-service causes, (4) dashboards reference multiple services, (5) multi-service deploys in annotations. Add hypothesis: "upstream dependency may have caused symptom in [target service]."
 
 ### Step 2: Service Discovery (Once — Reuse Everywhere)
 
@@ -373,11 +375,15 @@ Service mapping:
 
 **Name mismatch across backends?** → See Cross-System Service Correlation below.
 
+**If `dependency_probe=true`:** Apply Dependency Discovery Cascade (Appendix D). Store results in Session State as `known_dependencies`.
+
 ### Step 3: Determine Investigation Sequence
 
 - Alerts found (Step 0.5)? → Use alert labels as seed; begin at cheapest unqueried tier
 - Known failure pattern matched? → Use pattern fast-path tier
 - Otherwise → Apply signal cost hierarchy (Alerts done → Metrics → Traces → Logs)
+
+**If `known_dependencies` populated:** Consider querying upstream service metrics before deeper tiers on target — confirming upstream failure is cheaper than diagnosing downstream symptoms. State: "Checking [upstream] first because [trigger signal]."
 
 **State sequence before querying. Do not skip this.**
 
@@ -412,11 +418,11 @@ Service mapping:
 - **Critical check:** Does this evidence actually *explain* the symptom, or does it just *correlate*? What's the strongest counter-argument to the leading hypothesis?
 - Update/confirm/refute hypotheses. **If all hypotheses are ACTIVE after 2+ queries — your hypotheses may be wrong. Step back and form new ones.**
 - If 3 consecutive empty results → re-examine service name (wrong label? wrong time window?)
-- If anomaly found but causal validation (Step 4.5) returns SYMPTOM → **discover upstream dependency:**
-  1. `list_prometheus_metric_names(regex="span.*metric|trace.*")` → if found, query relationship labels (`peer.service`, `server`, `client`) filtered by target service → dependency list
-  2. No spanmetrics → `tempo_traceql-search({ resource.service.name="<svc>" }, limit=3)` → `tempo_get-trace` for each → extract unique `resource.service.name` from child spans
-  3. Logs: check error messages for failing service/host names (e.g., "connection refused to auth-service:8080")
-  Store discovered deps in Session State. Note: async/infrequent dependencies may not appear.
+- If anomaly found but causal validation (Step 4.5) returns SYMPTOM → **pivot upstream:**
+  1. If `known_dependencies` in Session State → pivot to most likely upstream (skip re-discovery)
+  2. Otherwise → apply Dependency Discovery Cascade (Appendix D)
+  3. Also check: log error messages for failing service/host names (e.g., "connection refused to auth-service:8080")
+  Store discovered deps in Session State. Async/infrequent deps may not appear.
   → Pivot investigation to most likely upstream service
 - **Root cause found → Step 4.5 → Step 8. Inconclusive → Step 5.**
 
@@ -676,3 +682,57 @@ Tempo stores data in Parquet. Cost = columns read × I/O. Only &&-only queries e
 ```
 
 **Checklist:** Scoped attributes ✓ Single { } for same-span ✓ No unscoped attrs ✓ No >> unless needed ✓
+
+---
+
+# Appendix D: Dependency Discovery Cascade
+
+Auto-discover service dependencies. Try each tier in order — **stop at first that produces results.**
+
+**Naming:** Upstream = calls us (we are `server`). Downstream = we call them (we are `client`).
+
+## Tier 1: Service Graph Metrics (1-2 queries)
+
+```
+list_prometheus_metric_names(regex="traces_service_graph_request_total")
+→ if exists:
+  Upstream:   query_prometheus('sum by (client, connection_type)
+              (rate(traces_service_graph_request_total{server="<svc>"}[5m])) > 0')
+  Downstream: query_prometheus('sum by (server, connection_type)
+              (rate(traces_service_graph_request_total{client="<svc>"}[5m])) > 0')
+```
+
+Bonus: error ratio via `_failed_total`/`_total`, latency via `_server_seconds` histogram.
+Gotcha: edges only appear with active traffic — use `[30m]` for low-traffic paths. Database/external services appear as virtual `server` nodes.
+
+## Tier 2: Spanmetrics Label Discovery (1-3 queries)
+
+```
+list_prometheus_metric_names(regex="span.*|traces_spanmetrics.*")
+→ if exists:
+  list_prometheus_label_names(matches="<spanmetric>{...}")
+  → find relationship labels: peer.service, net.peer.name, server, client, db.system
+  list_prometheus_label_values(labelName="<found_label>", matches="<metric>{job=\"<svc>\"}")
+```
+
+Note: label names vary by instrumentation — discover, never assume.
+
+## Tier 3: Trace Sampling (2-4 queries — fallback)
+
+```
+tempo_traceql-search({ resource.service.name="<svc>" }, limit=3)
+→ tempo_get-trace for each → extract unique resource.service.name
+  Parent spans → upstream. Child spans → downstream.
+```
+
+Note: sampling gives incomplete view — async/infrequent deps may not appear.
+
+## Output
+
+```
+Store in Session State:
+  known_dependencies:
+    upstream: [svc-a (sync), svc-b (messaging_system)]
+    downstream: [svc-c (sync), db-main (database)]
+    source: service_graph | spanmetrics | trace_sampling
+```
