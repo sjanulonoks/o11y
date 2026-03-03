@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.35
+version: 0.36
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -21,8 +21,9 @@ description: >
 - Evidence directly contradicts itself and you cannot determine which is correct
 
 **Flags (user can invoke at any point in conversation):**
-- `--history` → Load `resolutions/<service>.md` (relative to this skill). Resolve `<service>` from prompt or Session State. If service unknown, defer until after Step 2 discovery.
-- `--record` → After investigation, append resolution to `resolutions/<service>.md` using the resolved service name from Session State. Check for novelty first.
+- `--history` → Load `resolutions/<service>.md` at Step 1. Use past outcomes + blind spots as hypothesis seeds. MUST form contradicting hypothesis. @see library/history.md for details.
+- `--grade` → After Step 8: self-assess quality, ask user for outcome verdict, append to `resolutions/<service>.md`. @see library/grade.md
+- `--review <service>` → Standalone (no active investigation). Analyze accumulated entries, distill patterns, compact-rewrite `resolutions/<service>.md`. @see library/review.md
 
 ## Core Principle
 
@@ -339,7 +340,7 @@ For past-incident queries: set window around incident time ±15 min.
 - Form 2–3 hypotheses that could explain the symptom — **include at least one non-obvious cause** (e.g., not just "the service is broken" but "an upstream dependency changed behavior") → **add to Hypothesis Tracker**
 - State chosen investigation sequence: "Starting with Metrics (latency issue). If inconclusive → Traces."
 - **Ask yourself:** "If my first hypothesis is wrong, what would the evidence look like?" — this shapes what to query.
-- **`--history` active?** Load `resolutions/<service>.md` (service name from prompt or Session State; if resolved after Step 2, revisit hypotheses with history before Step 3). Add most recent historical pattern as hypothesis. MUST also form at least 1 hypothesis that contradicts it ("what if it's NOT [past cause]?"). Check past **blind spots** as hypothesis seeds. History informs — never shortcuts discovery.
+- **`--history` active?** Load `resolutions/<service>.md`. If file has a `## Distilled Patterns` section (written by `--review`), use patterns directly. Otherwise scan most recent 5 entries. Add most recent historical root cause as hypothesis. MUST form >=1 contradicting hypothesis ("what if it's NOT [past cause]?"). Past **blind spots** and **user corrections** are highest-priority hypothesis seeds. If service unknown pre-Step 2, defer: set `history_pending=true` in Session State, load after Step 2 resolves service name. History informs — never shortcuts discovery. @see library/history.md
 
 ### Step 2: Service Discovery (Once — Reuse Everywhere)
 
@@ -512,13 +513,7 @@ Ruled out: [hypotheses tested]
 
 **RULE:** Never directly trigger destructive actions (rollbacks, deletions). Always require human confirmation.
 
-**`--record` active?** Append to `resolutions/<service>.md` (create dir + file if first time). Before appending, read existing entries — **only record if this investigation reveals a novel root cause, key finding, or blind spot** not already captured. Skip if duplicate.
-```
-## [UTC timestamp] | [symptom ≤5 words]
-- **Root cause:** [1 sentence + evidence grade]
-- **Key finding:** [non-obvious insight]
-- **Blind spot:** [what wasn't checked or available]
-```
+**`--grade` active?** After outputting Step 8, invoke the grade protocol (@see library/grade.md): self-assess from conversation context, ask user for outcome verdict, append quality block to `resolutions/<service>.md`.
 
 ---
 
