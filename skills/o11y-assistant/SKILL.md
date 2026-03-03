@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.37
+version: 0.38
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -67,10 +67,13 @@ Evidence-based investigation across **all available** observability signals. Sin
 SESSION STATE
 ─────────────────────────────────────────────────────
 Datasource UIDs:   metrics=<uid>  logs=<uid>  traces=<uid>
-Service mapping:   <user_term> → traces:<name>, logs:<label>=<val>,
-                                 metrics:job=<val>
+Service mapping:   <user_term> → traces:<name>, logs:<service_label>=<val>,
+                                 metrics:<service_label>=<val>
 Time context:      current_utc=<ts>  investigation_window=<start>–<end>
 Severity:          [LOW|MEDIUM|HIGH|CRITICAL]
+Dependencies:      dependency_probe=[true|false]
+                   known_dependencies={upstream: [...], downstream: [...]}
+History:           history_pending=[true|false]
 ─────────────────────────────────────────────────────
 ```
 
@@ -113,6 +116,7 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | No blind queries | Always discover labels before constructing queries. |
 | Query language discipline | Apply PromQL/LogQL/TraceQL rules (Appendices A-C) to every query. |
 | Query budget | ~10 analytical queries max. Budget exhausted → present findings as-is (Step 8). |
+| Convention-first discovery | Try conventional names first (zero cost). Empty result from a query that *should* have data? → Don't conclude "doesn't exist." Discover via `label_names` / `metric_names` / `attribute_names` → adapt → store discovered mapping in Session State. |
 | Dependency direction | **Upstream** = services this service receives requests FROM (callers). **Downstream** = services this service sends requests TO (callees). |
 
 ### Parallelism Policy
@@ -270,7 +274,7 @@ Maintain this table across all investigation steps. Update after EVERY backend q
 | **DISTRIBUTION** | "p95", "p99" | `histogram_quantile(0.95, ...)` | N/A | `quantile_over_time(duration, 0.95)` |
 | **CENTRAL TENDENCY** | "average", "mean" | `avg_over_time(metric[15m])` | N/A | `avg_over_time(duration)` |
 | **RANGE** | "min", "max" | `max_over_time(metric[15m])` | N/A | `max_over_time(duration)` |
-| **EXISTENCE** | "is X up" | `up{job="X"}` | `{sel}` limit=1 | `{ service="X" }` limit=1 |
+| **EXISTENCE** | "is X up" | `up{<service_label>="X"}` | `{sel}` limit=1 | `{ service="X" }` limit=1 |
 | **COMPARISON** | "difference", "vs" | Two instant queries | Two instant queries | Two instant queries |
 | **TREND** | "over time" | Range query | Range query | Range query |
 
@@ -350,16 +354,16 @@ If service name in Session State: skip. If user provides exact names: use direct
 
 **Discovery order (try each available backend; use first successful result):**
 1. `search_dashboards(query="<service_name>")` — find monitoring context
-2. Tempo: `tempo_get-attribute-values(name="resource.service.name")` — OTel standard
-3. Metrics: `list_prometheus_label_values(labelName="job")` — fallback
-4. Logs: `list_loki_label_values(labelName="service_name")` — fallback
+2. Tempo: `tempo_get-attribute-values(name="resource.service.name")` — OTel standard. Empty? → `tempo_get-attribute-names` to find the actual service identity attribute.
+3. Metrics: try conventional labels (`job`, `service`, `app`) via `list_prometheus_label_values`. Empty? → `list_prometheus_label_names` to discover the service-identity label, then query its values.
+4. Logs: try conventional labels (`service_name`, `app`, `container_name`) via `list_loki_label_values`. Empty? → `list_loki_label_names` to discover the service-identity label.
 
 If `search_dashboards` returns matches: retrieve `get_dashboard_summary` + `get_dashboard_panel_queries` to understand instrumentation.
 
 **No specific service named?** ("everything is slow", "errors across the board"):
 1. `list_alert_rules(limit=1000)` → group firing alerts by service label → investigate highest-severity service first
 2. If no alerts: `search_dashboards(query="<symptom keyword>")` → find relevant dashboards
-3. Top-down: query `up{} == 0` + top 5 `rate(http_requests_total{status=~"5.."}[5m])` by job → identify affected services
+3. Top-down: query `up{} == 0` + discover HTTP error metric (`list_prometheus_metric_names(regex="http.*request.*total|http.*server.*request.*")`) → query top 5 error rates by service-identity label → identify affected services
 4. Pick the most affected service → proceed with standard discovery
 
 **Output + store in Session State:**
@@ -368,9 +372,10 @@ If `search_dashboards` returns matches: retrieve `get_dashboard_summary` + `get_
 ### SERVICE DISCOVERY
 User provided: "[term]"
 Service mapping:
-  traces: resource.service.name = "[exact]"
-  logs:   k8s_deployment_name = "[exact]" | service_name = "[exact]"
-  metrics: job = "[exact]" | service = "[exact]"
+  traces: <discovered_attr> = "[exact]"
+  logs:   <discovered_label> = "[exact]"
+  metrics: <discovered_label> = "[exact]"
+Discovery method: [conventional | discovered via label_names]
 ```
 
 **Name mismatch across backends?** → See Cross-System Service Correlation below.
@@ -404,7 +409,7 @@ Service mapping:
 
 #### Backend-Specific Notes
 
-**Prometheus:** Start with `up{job="<svc>"}` to confirm service exists. Step ≥ scrape interval (start with 60s). Use `query_prometheus_histogram` for percentiles. **Baseline:** For key metrics, compare across two horizons:
+**Prometheus:** Start with `up{<service_label>="<svc>"}` (use label from Session State service mapping) to confirm service exists. Empty? → convention-first discovery: try `job`, `service`, `app` via `list_prometheus_label_values`. Step ≥ scrape interval (start with 60s). Use `query_prometheus_histogram` for percentiles. **Baseline:** For key metrics, compare across two horizons:
 - **Trend** (is it worsening?): `offset 5m` → `offset 15m` → `offset 45m` — shows direction within the incident
 - **Seasonal baseline** (is this abnormal?): `offset 7d` / `offset 14d` — same day-of-week comparison. Avoid `offset 1d` (weekend/weekday seasonality misleads).
 
@@ -542,6 +547,8 @@ Ruled out: [hypotheses tested]
 
 ## Known Failure Pattern Fast-Paths
 
+**These use conventional metric names.** If the metric is not found → discover via `list_prometheus_metric_names(regex="<keyword>")` before concluding "not instrumented."
+
 | Pattern | Fast-Path Tier | Primary Signal |
 |---------|----------------|----------------|
 | "crash", "restart", "OOMKilled" | Metrics | `container_restarts` + memory, then Logs for last error |
@@ -574,7 +581,7 @@ Function: rate() over 5m
 Anti-pattern check: ❌ NOT using increase()/time
 ```
 
-**Step 4:** `query_prometheus(expr="rate(http_errors_total{job=\"<service>\"}[5m])", startTime="<incident-time>")` → Error rate spike confirmed.
+**Step 4:** `query_prometheus(expr="rate(http_errors_total{<service_label>=\"<service>\"}[5m])", startTime="<incident-time>")` → Error rate spike confirmed.
 `generate_deeplink(resourceType="explore", ...)` → Share with team.
 
 **Step 4.5:** Causal validation: deployment BEFORE spike, magnitude proportional. Verdict: ROOT CAUSE.
@@ -607,6 +614,7 @@ Ruled out: Infrastructure (no infra alerts), upstream (no dependency errors)
 | "Don't search dashboards — query directly" | FORBIDDEN: Dashboards provide service discovery + instrumentation context |
 | "Skip annotations — focus on symptom" | FORBIDDEN: Annotations correlate timing with events. MANDATORY. |
 | "Tool timed out — give up on this backend" | FORBIDDEN: Retry once. If persistent, document failure and continue. |
+| "Empty result = service doesn't exist" | FORBIDDEN: Empty may mean wrong label/metric name. Discover actual names before concluding absence. |
 
 ---
 
@@ -633,7 +641,7 @@ When MCP tools fail (timeout, datasource unreachable, unexpected error):
 ```
 🔴 {label=~".*word.*"}              UNANCHORED WILDCARD — disables index
 🔴 sum by (user_id|request_id)()   HIGH-CARDINALITY AGG — no reduction
-🟡 bare metric name, no labels      NO LABEL FILTER — add job= minimum
+🟡 bare metric name, no labels      NO LABEL FILTER — add service-identity label minimum
 ```
 
 **Checklist:** Labels first ✓ No unanchored regex ✓ No bare metric ✓ No high-cardinality by ✓ Step ≥ scrape ✓
@@ -712,7 +720,7 @@ list_prometheus_metric_names(regex="span.*|traces_spanmetrics.*")
 → if exists:
   list_prometheus_label_names(matches="<spanmetric>{...}")
   → find relationship labels: peer.service, net.peer.name, server, client, db.system
-  list_prometheus_label_values(labelName="<found_label>", matches="<metric>{job=\"<svc>\"}")
+  list_prometheus_label_values(labelName="<found_label>", matches="<metric>{<service_label>=\"<svc>\"}")
 ```
 
 Note: label names vary by instrumentation — discover, never assume.
