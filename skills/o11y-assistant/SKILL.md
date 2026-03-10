@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.41
+version: 0.42
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -429,7 +429,7 @@ Discovery method: [conventional | discovered via label_names]
 #### Common Pattern (All Backends)
 
 1. Resolve datasource UID [from Session State or `list_datasources`]
-2. Discover labels (label_names → label_values)
+2. Discover labels (label_names → label_values) — skip if already in Session State from Step 2
 3. Complete Query Plan — classify intent, select function, document plan
 4. Apply query language checklist (Appendix A/B/C) — rewrite non-compliant patterns
 5. Execute query with correct type (Instant for values, Range for trends)
@@ -490,11 +490,14 @@ Anomaly: [description]
 
 <completion_contract>
 DONE WHEN:      All active hypotheses CONFIRMED or REFUTED, AND Signal Coverage shows
-                ✅ or 🔲 for every signal relevant to active hypotheses.
+                ✅ or 🔲 for every signal (no ⬜ remains) relevant to active hypotheses.
 KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its status
                 — name the backend + query before proceeding. If you can't name it, STOP.
+                AND fewer than 10 analytical queries executed (query budget not exhausted).
 BLOCKED FORMAT: "[BLOCKED: {signal}] — missing: {what}. Strategies tried: {list}."
                 Use after 2+ recovery strategies fail on an instrumentation gap.
+NOTE: [INSTRUMENTATION_GAP] = Signal Coverage row marker (Step 4 tracking).
+      [BLOCKED] = completion-level output tag (this contract).
 </completion_contract>
 
 **Instrumentation gap exception:** If a backend returned empty AND discovery attempts suggest it may not be instrumented for this service → mark as `[INSTRUMENTATION_GAP]` in Hypothesis Tracker AND Signal Coverage, do NOT count it as a "no anomaly" backend.
@@ -533,11 +536,13 @@ If any step fails → return to earliest failing step before outputting.
 ```
 <output_contract: TRIAGE>
 Required sections (in order): status-line, root-cause, immediate-actions, ruled-out
-Length: ≤8 lines total. No prose. Root cause MUST reference a CAUSAL VALIDATION block.
+Length: ≤8 lines total. No prose.
+Root cause MUST reference: alert name + state + labels (alert-confirmed evidence; CAUSAL VALIDATION not required on this fast-path).
+Omit: contributing-factors, evidence-appendix, resolution-queries (→ use DEEP DIVE if needed).
 </output_contract>
 
 🔴 [Service]: [what happened in 1 sentence]
-Root cause: [1 sentence, evidence-backed, with Evidence Strength grade] → ref: CAUSAL VALIDATION above
+Root cause: [1 sentence] → grounded in: alert [name] state=[state] labels=[labels]
 Immediate action: [1–2 bullets]
 Ruled out: [hypotheses refuted]
 ```
@@ -547,6 +552,7 @@ Ruled out: [hypotheses refuted]
 <output_contract: STANDARD>
 Required sections (in order): summary, timeline, evidence, root-cause, immediate-action
 Root cause section MUST reference a completed CAUSAL VALIDATION block from Step 4.5.
+Omit: contributing-factors, evidence-appendix (→ use DEEP DIVE for 3+ backend incidents).
 </output_contract>
 ```
 1. **Summary** — What / Impacted / Window
@@ -566,6 +572,7 @@ Root cause section MUST reference a completed CAUSAL VALIDATION block from Step 
 <output_contract: DEEP DIVE>
 Required sections (in order): summary, timeline, evidence, root-cause, contributing-factors, evidence-appendix
 Root cause MUST reference CAUSAL VALIDATION. Contributing factors MUST have Evidence Strength grade.
+Multi-service: if root cause is in upstream service X, prefix output header: "⛓️ [TargetService] ← upstream: [RootCauseService]"; root-cause section describes [RootCauseService].
 [context-override: synthesis-breadth > retrieval-precision for 3+ backend investigations]
 Retain full Signal Coverage Map + complete Hypothesis Tracker in output.
 </output_contract>
@@ -647,7 +654,7 @@ Cannot confirm or rule out: [hypotheses that remain ACTIVE due to missing signal
 
 ## Known Failure Pattern Fast-Paths
 
-**These use conventional metric names.** If the metric is not found → discover via `list_prometheus_metric_names(regex="<keyword>")` before concluding "not instrumented."
+**These use conventional metric names.** Empty fast-path result ≠ pattern does not apply — metric name may differ. Discover via `list_prometheus_metric_names(regex="<keyword>")` before concluding pattern inapplicable or service not instrumented.
 
 | Pattern | Fast-Path Tier | Primary Signal |
 |---------|----------------|----------------|
