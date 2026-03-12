@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.46
+version: 0.47
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -82,9 +82,11 @@ Time context:      current_utc=<ts>  investigation_window=<start>–<end>
 Severity:          [LOW|MEDIUM|HIGH|CRITICAL]
 Mode:              [TBD|TRIAGE|STANDARD|DEEP DIVE]   ← set at Step 1 once Signal Landscape known
 Budget:            0 analytical queries / [3|8|15] ceiling
+Budget extensions: 0 of 1 allowed
 Dependencies:      dependency_probe=[true|false]
                    known_dependencies={upstream: [...], downstream: [...]}
 History:           history_pending=[true|false]
+Instrumentation gaps: []   ← populate with [signal, backend] when 🔲 confirmed; check at Step 0.5 on re-investigation
 ─────────────────────────────────────────────────────
 ```
 
@@ -137,6 +139,8 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | | **Count analytical queries only** — discovery/label/metadata calls are free. \
 | | Budget ceiling reached AND Δ-Quality still >0? → Emit inline and continue: \
 | | `[BUDGET: extended — N queries used, last query changed <hypothesis> status]` \
+| | **Budget extension: 1× per investigation only.** Second ceiling hit after extension → emit \
+| | `[BUDGET: FINAL — synthesizing from current evidence]` and proceed immediately to Step 8. \
 | | Hard ceiling 25 applies regardless. Update Session State Budget field after every analytical query. |
 | Convention-first discovery | Try conventional names first (zero cost). Empty result from a query that *should* have data? → Don't conclude "doesn't exist." Discover via `label_names` / `metric_names` / `attribute_names` → adapt → store discovered mapping in Session State. |
 | Dependency direction | **Upstream** = services this service receives requests FROM (callers). **Downstream** = services this service sends requests TO (callees). |
@@ -170,6 +174,11 @@ Assign to every finding before using it to support a conclusion:
 | **SPECULATIVE** | Pattern match without direct evidence | Omit from STANDARD. In DEEP DIVE: mention in Further Investigation subsection only. Never use to support root cause claim. |
 
 **Grounding rule:** Every finding cited in Step 8 MUST reference the specific tool call and returned value that produced it. If a claim cannot be traced to a tool output, label it `[INFERENCE]` and do not use it to support a root cause verdict.
+
+**Root cause verdict requirements:**
+- **ROOT CAUSE** verdict requires: ≥1 STRONG finding, OR ≥2 MODERATE corroborating findings (independently observed, not the same datapoint from two angles).
+- A single MODERATE finding alone → CONTRIBUTING FACTOR verdict at most.
+- State in every CAUSAL VALIDATION block: `"Verdict supported by: [grade] ×[N]"`
 
 ---
 
@@ -390,6 +399,7 @@ For past-incident queries: set window around incident time ±15 min.
 5. **Decision:**
    - Firing alerts found? → Correlate with symptoms. Use alert labels as service discovery seed. If alerts fully explain symptom → Step 8 (TRIAGE).
    - No alerts? → Check annotations; proceed to Step 1.
+   - **Known instrumentation gaps in Session State?** If `instrumentation_gaps` is non-empty AND the gap's signal tier is now available in Signal Landscape → probe the gap first in Step 4 and note: `[GAP RECHECK: previously absent, now instrumented]`. If still absent → confirm gap persists, skip.
 
 ### Step 1: Interpret & Hypotheses
 
@@ -458,6 +468,8 @@ Discovery method: [conventional | discovered via label_names]
 
 **If `known_dependencies` populated:** Consider querying upstream service metrics before deeper tiers on target — confirming upstream failure is cheaper than diagnosing downstream symptoms. State: "Checking [upstream] first because [trigger signal]."
 
+**If ≥4 hypotheses ACTIVE:** Triage before querying — rank by: (1) highest evidence strength in favour, (2) cheapest signal tier to check, (3) highest blast radius if confirmed. State the ranking before proceeding. Do **not** distribute budget equally across all hypotheses.
+
 **State sequence before querying. Do not skip this.**
 
 **CRITICAL:** Before querying each backend, complete Query Plan.
@@ -514,7 +526,8 @@ For each detected anomaly:
 
 1. **Cause or Symptom?** — If I fix X, does the original symptom disappear?
 2. **Coincidence check** — Did X start BEFORE the symptom? Is the magnitude proportional?
-3. **One level deeper** — "Why did X happen?" If the answer points to another system, THAT is the root cause candidate.
+   *Proportional: anomaly in X is directionally consistent AND ≥30% of the symptom’s relative magnitude vs pre-incident baseline. State both numbers explicitly.*
+3. **One level deeper (2× max)** — "Why did X happen?" If the answer points to another system, THAT is the root cause candidate. Apply at most twice — if causal chain still leads outward after 2 levels → declare `[SYSTEMIC ROOT CAUSE: N layers]` naming all layers. Do not recurse further.
 
 ```
 ## CAUSAL VALIDATION
@@ -543,15 +556,17 @@ Anomaly: [description]
 DONE WHEN:      All active hypotheses CONFIRMED or REFUTED, AND Signal Coverage shows
                 ✅ or 🔲 for every signal (no ⬜ remains) relevant to active hypotheses.
 KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its status
-                — name the backend + query before proceeding. If you can't name it, STOP.
+                — name the backend + query before proceeding. If you can’t name it, STOP.
                 AND within budget ceiling for active mode (STANDARD ≤8 / DEEP DIVE ≤15;
                 EXPLORE/VALIDATE ≤5). Budget ceiling reached AND Δ-Quality >0 → emit
                 budget-extension note and continue (see Operating Constraints). Hard ceiling 25.
-                AND last query materially changed a hypothesis (Δ-Quality). If last 2 queries
-                both returned signal that left every hypothesis ACTIVE/unchanged → STOP.
-                Inconclusive signal that accumulates without resolution = budget waste.
+                AND last query had non-zero Δ-Quality. Δ-Quality = ZERO when ALL hypothesis
+                states are unchanged AND no new hypothesis formed AND no root cause first
+                identified. Two consecutive Δ-Quality ZERO queries → STOP regardless of
+                remaining budget. Inconclusive signal accumulating without resolution = budget waste.
 BLOCKED FORMAT: "[BLOCKED: {signal}] — missing: {what}. Strategies tried: {list}."
                 Use after 2+ recovery strategies fail on an instrumentation gap.
+                When marked BLOCKED: add [signal, backend] to Session State instrumentation_gaps.
 NOTE: [INSTRUMENTATION_GAP] = Signal Coverage row marker (Step 4 tracking).
       [BLOCKED] = completion-level output tag (this contract).
 </completion_contract>
@@ -594,6 +609,7 @@ If any step fails → return to earliest failing step before outputting.
 Required sections (in order): status-line, root-cause, immediate-actions, ruled-out
 Length: ≤8 lines total. No prose.
 Root cause MUST reference: alert name + state + labels (alert-confirmed evidence; CAUSAL VALIDATION not required on this fast-path).
+⚠️ TRIAGE assumes alert is causally sufficient. If the user asks "why" or challenges the verdict → escalate to STANDARD investigation (alerts describe symptoms, not always root causes).
 Omit: contributing-factors, evidence-appendix, resolution-queries (→ use DEEP DIVE if needed).
 </output_contract>
 
@@ -606,10 +622,11 @@ Ruled out: [hypotheses refuted]
 #### STANDARD Format
 ```
 <output_contract: STANDARD>
-Required sections (in order): summary, timeline, evidence, root-cause, immediate-action
+Required sections (in order): summary, timeline, evidence, root-cause, immediate-action, ruled-out
 Root cause section MUST reference a completed CAUSAL VALIDATION block from Step 4.5.
 Optional: contributing-factors (≤2 bullets; include only if ≥1 MODERATE finding is distinct from root cause and actionable).
 Omit: evidence-appendix (→ use DEEP DIVE for 3+ backend incidents).
+ruled-out (required): for each REFUTED hypothesis, name the specific evidence that refuted it — 1 line max per hypothesis.
 </output_contract>
 ```
 1. **Summary** — What / Impacted / Window
@@ -628,9 +645,10 @@ Omit: evidence-appendix (→ use DEEP DIVE for 3+ backend incidents).
 #### DEEP DIVE Format
 ```
 <output_contract: DEEP DIVE>
-Required sections (in order): summary, timeline, evidence, root-cause, contributing-factors, evidence-appendix
+Required sections (in order): summary, timeline, evidence, root-cause, contributing-factors, evidence-appendix, ruled-out
 Optional: further-investigation (include only if SPECULATIVE findings exist — state the signal that would confirm each one).
 Root cause MUST reference CAUSAL VALIDATION. Contributing factors MUST have Evidence Strength grade.
+ruled-out (required): for each REFUTED hypothesis, name the specific evidence that refuted it — 1 line max per hypothesis.
 Multi-service: if root cause is in upstream service X, prefix output header: "⛓️ [TargetService] ← upstream: [RootCauseService]"; root-cause section describes [RootCauseService].
 [context-override: synthesis-breadth > retrieval-precision for 3+ backend investigations]
 Retain full Signal Coverage Map + complete Hypothesis Tracker in output.
@@ -639,7 +657,8 @@ Retain full Signal Coverage Map + complete Hypothesis Tracker in output.
 Standard format PLUS:
 6. **Contributing Factors** — What conditions enabled the failure? (with Evidence Strength grade)
 7. **Evidence Appendix** — Queries used, raw findings, deeplinks
-8. **Further Investigation** (optional) — SPECULATIVE findings only; for each, state what signal would confirm it.
+8. **Ruled Out** — Each REFUTED hypothesis with the specific evidence that refuted it (1 line each)
+9. **Further Investigation** (optional) — SPECULATIVE findings only; for each, state what signal would confirm it.
 
 #### NO ANOMALY Format
 ```
