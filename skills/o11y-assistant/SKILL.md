@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.44
+version: 0.45
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -78,6 +78,8 @@ Service mapping:   <user_term> → traces:<name>, logs:<service_label>=<val>,
                                  metrics:<service_label>=<val>
 Time context:      current_utc=<ts>  investigation_window=<start>–<end>
 Severity:          [LOW|MEDIUM|HIGH|CRITICAL]
+Mode:              [TBD|TRIAGE|STANDARD|DEEP DIVE]   ← set at Step 1 once Signal Landscape known
+Budget:            0 analytical queries / [3|8|15] ceiling
 Dependencies:      dependency_probe=[true|false]
                    known_dependencies={upstream: [...], downstream: [...]}
 History:           history_pending=[true|false]
@@ -125,7 +127,12 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | Evidence-based conclusions | Root cause = tool evidence. OR state "no root cause found". |
 | No blind queries | Always discover labels before constructing queries. |
 | Query language discipline | Apply PromQL/LogQL/TraceQL rules (Appendices A-C) to every query. |
-| Query budget | ~10 analytical queries max. Budget exhausted → present findings as-is (Step 8). |
+| Query budget | **Primary stop: Δ-Quality (Step 5).** Numeric ceilings are circuit breakers only. \
+| | Mode ceilings: TRIAGE ≤3 · STANDARD ≤8 · DEEP DIVE ≤15 analytical queries. \
+| | **Count analytical queries only** — discovery/label/metadata calls are free. \
+| | Budget ceiling reached AND Δ-Quality still >0? → Emit inline and continue: \
+| | `[BUDGET: extended — N queries used, last query changed <hypothesis> status]` \
+| | Hard ceiling 25 applies regardless. Update Session State Budget field after every analytical query. |
 | Convention-first discovery | Try conventional names first (zero cost). Empty result from a query that *should* have data? → Don't conclude "doesn't exist." Discover via `label_names` / `metric_names` / `attribute_names` → adapt → store discovered mapping in Session State. |
 | Dependency direction | **Upstream** = services this service receives requests FROM (callers). **Downstream** = services this service sends requests TO (callees). |
 
@@ -187,6 +194,13 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 
 ## Tool Reference
 
+> **Load discipline (selective attention):** Always read: Utility · Grafana Configuration Discovery · Grafana Alerts & Rules · Grafana Dashboards · Grafana Annotations.
+> After Step 0.5 Signal Landscape is known, read backend sections **only for found backends**:
+> - `metrics=[uid]` present → read Prometheus/Mimir section
+> - `logs=[uid]` present → read Loki section
+> - `traces=[uid]` present → read Tempo/Traces section
+> Skip backend sections for absent tiers (already marked 🔲 in Signal Coverage). Tool details for skipped backends do not need to be attended.
+
 ### Utility
 
 | Tool | Required Params | Behavior |
@@ -231,8 +245,8 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 | `list_prometheus_metric_metadata` | `datasourceUid`, `metric` (optional) | Confirm metric type (counter/gauge/histogram) |
 | `list_prometheus_label_names` | `datasourceUid`, `matches` (optional) | Discover label keys |
 | `list_prometheus_label_values` | `datasourceUid`, `labelName`, `matches` (optional) | Discover label values |
-| `query_prometheus` | `datasourceUid`, `expr`, `startTime`, `queryType` ("instant"/"range"), `endTime`, `stepSeconds` | Execute PromQL. Empty result = no data, not always "no problem". |
-| `query_prometheus_histogram` | `datasourceUid`, `metric` (base, no _bucket), `percentile` (0-100), `labels`, `rateInterval` | Generate histogram_quantile. Labels: `"key=\"value\""` |
+| `query_prometheus` | `datasourceUid`, `expr`, `startTime`, `queryType` ("instant"/"range"), `endTime`, `stepSeconds` | Execute PromQL. Empty result = no data, not always "no problem". ⚠️ **Do NOT use** when intent is a percentile/latency distribution — use `query_prometheus_histogram` instead. |
+| `query_prometheus_histogram` | `datasourceUid`, `metric` (base, no _bucket), `percentile` (0-100), `labels`, `rateInterval` | Generate histogram_quantile. Labels: `"key=\"value\""` ⚠️ **Do NOT use** for non-histogram metrics (counters, gauges) — use `query_prometheus`. |
 
 ### Loki
 
@@ -241,8 +255,8 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 | `list_loki_label_names` | `datasourceUid` | Discover log stream label keys |
 | `list_loki_label_values` | `datasourceUid`, `labelName` | Discover values. 🟡 Filter higher-level label first. |
 | `query_loki_stats` | `datasourceUid`, `logql` (selector only) | **MANDATORY before broad log pull.** Returns streams, chunks, entries, bytes. |
-| `query_loki_logs` | `datasourceUid`, `logql`, `limit` (default 10, max 100), `direction`, `queryType` | Execute LogQL. Start limit=10. 🔴 Log timestamps = nanosecond strings. |
-| `search_logs` | `DatasourceUID`, `Pattern`, `Start`, `End`, `Limit` | Quick text/regex search. Auto-generates queries. |
+| `query_loki_logs` | `datasourceUid`, `logql`, `limit` (default 10, max 100), `direction`, `queryType` | Execute LogQL. Start limit=10. 🔴 Log timestamps = nanosecond strings. ⚠️ **Do NOT use** for quick keyword scan without a known selector — use `search_logs` instead. |
+| `search_logs` | `DatasourceUID`, `Pattern`, `Start`, `End`, `Limit` | Quick text/regex search. Auto-generates queries. ⚠️ **Do NOT use** when you need full LogQL control (metric queries, pipeline filters, rate aggregations) — use `query_loki_logs` instead. |
 
 ### Tempo / Traces
 
@@ -312,6 +326,7 @@ User intent: [COUNT/RATE/DISTRIBUTION/etc]
 Query type: [Instant / Range]
 Function: [specific function]
 Anti-pattern check: ❌ NOT using [wrong approach] because [reason]
+Budget: [N/ceiling] analytical queries used   ← increment Session State Budget after this query
 ```
 
 ---
@@ -520,7 +535,9 @@ DONE WHEN:      All active hypotheses CONFIRMED or REFUTED, AND Signal Coverage 
                 ✅ or 🔲 for every signal (no ⬜ remains) relevant to active hypotheses.
 KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its status
                 — name the backend + query before proceeding. If you can't name it, STOP.
-                AND fewer than 10 analytical queries executed (query budget not exhausted).
+                AND within budget ceiling for active mode (TRIAGE ≤3 / STANDARD ≤8 / DEEP DIVE ≤15).
+                Budget ceiling reached AND Δ-Quality >0 → emit budget-extension note and continue
+                (see Operating Constraints). Hard ceiling 25 applies regardless.
                 AND last query materially changed a hypothesis (Δ-Quality). If last 2 queries
                 both returned signal that left every hypothesis ACTIVE/unchanged → STOP.
                 Inconclusive signal that accumulates without resolution = budget waste.
