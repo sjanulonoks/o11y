@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.43
+version: 0.44
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -374,6 +374,10 @@ For past-incident queries: set window around incident time ±15 min.
 ### Step 1: Interpret & Hypotheses
 
 - Restate user issue in 1 sentence
+- **Motivated Reasoning check:** Does the user's phrasing imply a preferred conclusion?
+  Signal phrases: "confirm that...", "I think it's...", "shouldn't it be...", "just check X".
+  If YES → emit before forming hypotheses: `⚠️ PRIOR DETECTED: [prior]. Suspended. Analysis below treats it as one hypothesis among peers — will confirm OR refute.`
+  Do NOT silently adopt the user's prior as the leading hypothesis.
 - **`<missing_context_gating>`:** If service name is not yet known (Step 2 not complete), mark ALL hypotheses formed here as `[ASSUMED-SERVICE]`. Do NOT commit to an investigation sequence until Step 2 confirms which service to target. Hypotheses are placeholders, not plans.
 - **Systems context:** What upstream/downstream dependencies does this service have? What recently changed in this part of the system? (Check annotations, deploy history)
 - Apply Known Failure Pattern fast-path (see below) — if matched, shortcut to indicated tier
@@ -465,6 +469,11 @@ Discovery method: [conventional | discovered via label_names]
 - **Critical check:** Does this evidence actually *explain* the symptom, or does it just *correlate*? What's the strongest counter-argument to the leading hypothesis?
 - Update/confirm/refute hypotheses. **If all hypotheses are ACTIVE after 2+ queries — your hypotheses may be wrong. Step back and form new ones.**
 - If 3 consecutive empty results → re-examine service name (wrong label? wrong time window?)
+- **Temporal Bias check:** Are you treating a snapshot as a steady state? Fires when:
+  (a) concluding "healthy" from a window <1h during a known intermittent issue;
+  (b) using service mapping or topology from a previous session without re-verifying;
+  (c) assuming infra config (scrape interval, sampling rate, retention) unchanged.
+  If any applies → note inline: `[TEMPORAL ASSUMPTION: <X> treated as current — unverified]`
 - If anomaly found but causal validation (Step 4.5) returns SYMPTOM → **pivot upstream:**
   1. If `known_dependencies` in Session State → pivot to most likely upstream (skip re-discovery)
   2. Otherwise → apply Dependency Discovery Cascade (Appendix D)
@@ -489,6 +498,12 @@ Anomaly: [description]
 ├─ Cause or symptom? [cause | symptom of ___]
 ├─ Timing: X started [before|after|simultaneously] with symptom
 ├─ One level deeper: X happened because [___]
+├─ Reversal test: strongest evidence AGAINST this verdict = [___]
+│   Absent → "Reversal clear — ¬ROOT CAUSE requires [X] which is absent from all queried backends."
+│   Present and unresolved → downgrade to CONTRIBUTING FACTOR; do NOT declare ROOT CAUSE.
+├─ Black boxes: [what was NOT checked that could invalidate this verdict — name ≥1]
+│   Examples: unsampled traces, external deps absent from service graph, config-only changes
+│   without metrics exposure, async/batch paths not in the investigation window.
 └─ Verdict: [ROOT CAUSE | CONTRIBUTING FACTOR | SYMPTOM | COINCIDENCE]
 ```
 
@@ -498,12 +513,17 @@ Anomaly: [description]
 
 ### Step 5: Continue or Stop?
 
+**Drift check (RCoT):** Before evaluating the completion contract, reconstruct the user's original question from your current leading hypothesis. `ALIGNED` = hypothesis answers what was asked. `EXPANDED` = useful but broader — note it. `DRIFTED` = conclusion no longer addresses original question → reanchor before proceeding.
+
 <completion_contract>
 DONE WHEN:      All active hypotheses CONFIRMED or REFUTED, AND Signal Coverage shows
                 ✅ or 🔲 for every signal (no ⬜ remains) relevant to active hypotheses.
 KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its status
                 — name the backend + query before proceeding. If you can't name it, STOP.
                 AND fewer than 10 analytical queries executed (query budget not exhausted).
+                AND last query materially changed a hypothesis (Δ-Quality). If last 2 queries
+                both returned signal that left every hypothesis ACTIVE/unchanged → STOP.
+                Inconclusive signal that accumulates without resolution = budget waste.
 BLOCKED FORMAT: "[BLOCKED: {signal}] — missing: {what}. Strategies tried: {list}."
                 Use after 2+ recovery strategies fail on an instrumentation gap.
 NOTE: [INSTRUMENTATION_GAP] = Signal Coverage row marker (Step 4 tracking).
@@ -574,6 +594,7 @@ Omit: contributing-factors, evidence-appendix (→ use DEEP DIVE for 3+ backend 
    [T-0]   Alert fires (Grafana: "High Error Rate" → firing)
    ```
 3. **Evidence** — Per-backend findings with Evidence Strength grades
+   **Known unknowns:** [black boxes from CAUSAL VALIDATION Step 4.5 not resolved by investigation]
 4. **Root Cause** — Evidence-based with causal validation (Step 4.5)
 5. **Immediate Action** — 1–2 bullets (only if root cause confirmed)
 
