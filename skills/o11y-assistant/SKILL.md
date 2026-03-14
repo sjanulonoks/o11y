@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.49
+version: 0.51
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -280,9 +280,9 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 |------|-----------------|----------|
 | `tempo_get-attribute-names` | `datasourceUid`, `scope` (optional) | Discover available trace attributes |
 | `tempo_get-attribute-values` | `datasourceUid`, `name` | Discover values. 🔴 `filter-query`: single `{ }`, `&&` only (no `\|\|`). |
-| `tempo_traceql-search` | `datasourceUid`, `query`, `start`, `end`, `limit` | **Search queries** (find traces). ❌ Do NOT send aggregations here. *Heuristic: Unknown-Unknowns (Mechanistic Proof):* `{A} >> {B}` proves wait-time *between* components. Pivot to 0 logs = **Rate-Limiting Drop**, not evidence of absence. |
-| `tempo_traceql-metrics-instant` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** (count, rate, quantile, avg). Single value. *Heuristic: Known-Unknowns (The Spatial Proof):* `topk(5, {status=error} | count_over_time...)` dynamically calculates structural dimensions discarded by Prometheus. |
-| `tempo_traceql-metrics-range` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** with time-series output. *Heuristic: Known-Unknowns (The Temporal Proof):* `rate({status=error && peer.service="discovered_peer"}[1m])` mathematically proves the spatially isolated node's degradation aligns temporally with the incident (satisfying Coincidence Check). |
+| `tempo_traceql-search` | `datasourceUid`, `query`, `start`, `end`, `limit` | **Search queries** (find traces). ❌ Do NOT send aggregations here. |
+| `tempo_traceql-metrics-instant` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** (count, rate, quantile, avg). Single value. |
+| `tempo_traceql-metrics-range` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** with time-series output. |
 | `tempo_get-trace` | `datasourceUid`, `trace_id` | Retrieve full trace by ID |
 
 **Tempo query type validation:**
@@ -333,10 +333,17 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 | **COMPARISON** | "difference", "vs" | Two instant queries | Two instant queries | Two instant queries |
 | **TREND** | "over time" | Range query | Range query | Range query |
 
+### Epistemic Tension (Classify Before Querying)
+
+*   **Known-Knowns (KK) — The Symptom Bound:** What is explicitly measured (the "What"). *Goal: Establish the factual perimeter of the incident without inferring causality.*
+*   **Known-Unknowns (KU) — The Causal Link:** What the local signal discarded (the immediate "Why"). *Goal: Actively construct the causal graph. Use a Spatial Proof (isolate the failing component) and a Temporal Proof (prove alignment) to forge an unbroken link to the next node.*
+*   **Unknown-Unknowns (UU) — The Uninstrumented 'Why':** The void where the causal chain risks breaking (e.g., hidden feedback loops, rate limits). *Goal: Sustain the 5-Whys traversal. Deduce missing links via strict Mechanistic Proofs (inferring causality from the structural, logical absence of expected signals).*
+
 ### Query Plan (Document Before EVERY Analytical Query)
 
 ```
 ## QUERY PLAN
+Epistemic State: [KK (bound the symptom) | KU (forge causal link) | UU (deduce uninstrumented 'Why')]
 Backend: [Prometheus/Loki/Tempo]
 User intent: [COUNT/RATE/DISTRIBUTION/etc]
 Query type: [Instant / Range]
@@ -535,7 +542,7 @@ For each detected anomaly:
    *Proportional: anomaly in X is directionally consistent AND ≥30% of the symptom’s relative magnitude vs pre-incident baseline. State both numbers explicitly.*
    *(Evidence Sufficiency: Do not declare ROOT CAUSE based solely on identifying a dependency or Structural Key.)*
 5. **One level deeper (2× max)** — "Why did X happen?" If the answer points to another system, THAT is the root cause candidate. Apply at most twice — if causal chain still leads outward after 2 levels → declare `[SYSTEMIC ROOT CAUSE: N layers]` naming all layers. Do not recurse further.
-6. **Epistemic State Check** (TraceQL ONLY): If metrics yield empty topologies, label the diagnostic gap a `Known-Unknown` (Black Box). Before running TraceQL, acknowledge that `with(sample=true)` provides a statistical approximation of the fault. If resolving a Trace via Logs fails, actively flag the non-linear interaction (Rate-Limiting Drop) before discarding the diagnostic hypothesis.
+6. **Epistemic State Check** (Universal): Acknowledge Diagnostic Gaps (KU) as a broken causal chain requiring immediate traversal. Actively flag The Void (UU) when expected signals vanish across boundaries (e.g. Rate-Limiting Drop), recognizing this structural absence as the necessary deductive bridge to the final root cause.
 
 ```
 ## CAUSAL VALIDATION
