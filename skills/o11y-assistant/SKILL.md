@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.55
+version: 0.56
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -14,7 +14,7 @@ reasoning_effort: >
   - DEEP DIVE (3+ backends, contradictions, dependency chains): medium-high
 ---
 
-# O11y Assistant — Unified Observability
+# O11y Assistant — Deterministic Finite Automaton (DFA)
 
 ## Autonomy Rule
 
@@ -45,6 +45,23 @@ Evidence-based investigation across **all available** observability signals. Sin
 | LOGS | Loki, ClickHouse, CloudWatch Logs | `list_datasources(type="loki")` etc. |
 
 **Unknown backend?** → `get_query_examples(DatasourceType=<type>)` to self-teach query syntax before proceeding.
+
+---
+
+## Interface Contract (The 7 Questions)
+
+**WHAT:** Diagnoses systemic anomalies by calculating spatial bounds and temporal correlation (ΔT) across observability backends.
+**WHEN:** Triggered by user alert queries, observed anomalies, or system degradation reports.
+**NEEDS:** Time-bounded symptoms (or `T=0` anchor point), explicit user constraints.
+**PRODUCES:** Strict resolution state containing Tripartite Causality or defined escalation path.
+**FAILS:** When Signal Landscape implies tiers that are misconfigured, or when `Δ-Quality` metrics drop to 0 for two consecutive steps.
+**RELATES:** Connects `alert` to `node_metric` to `trace_path` to `log_exception`. 
+**STATE_TRANSITIONS:**
+- `S0_DISCOVERY`: Map available data sources (Step 0 - 0.5).
+- `S1_HYPOTHESIS`: Generate mathematically testable claims (Step 1 - 3).
+- `S2_EXECUTION`: Execute queries; prioritize `ctx_batch_execute` for high-cardinality processing to protect context (Step 4, 6, 7).
+- `S3_VERIFICATION`: Apply Telemetry Calculus & ΔT temporal proof (Step 4.5, 5).
+- `S4_RESOLUTION`: Construct strict output schema (Step 8).
 
 ---
 
@@ -133,6 +150,7 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | Evidence-based conclusions | Root cause = tool evidence. OR state "no root cause found". |
 | No blind queries | Always discover labels before constructing queries. |
 | Query language discipline | Apply PromQL/LogQL/TraceQL rules (Appendices A-C) to every query. |
+| Context-Mode Mandate | **FORBIDDEN:** Reading massive raw payloads (high-cardinality logs/traces) directly into context. You MUST process bulky datasets inside the sandbox using Context-Mode `ctx_batch_execute` or `ctx_execute` to filter noise before returning the summary. |
 | Query budget | **Primary stop: Δ-Quality (Step 5).** Numeric ceilings are circuit breakers only. \
 | | INVESTIGATE depth ceilings: STANDARD ≤8 · DEEP DIVE ≤15 analytical queries. \
 | | TRIAGE: 0 analytical queries by definition (alert evidence self-sufficient; no backend queries). \
@@ -142,7 +160,7 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | | Budget ceiling reached AND Δ-Quality still >0? → Emit inline and continue: \
 | | `[BUDGET: extended — N queries used, last query changed <hypothesis> status]` \
 | | **Budget extension: 1× per investigation only.** Second ceiling hit after extension → emit \
-| | `[BUDGET: FINAL — synthesizing from current evidence]` and proceed immediately to Step 8. \
+| | `[BUDGET: FINAL — synthesizing from current evidence]` and transition immediately to `S4_RESOLUTION`. \
 | | Hard ceiling 25 applies regardless. Update Session State Budget field after every analytical query. |
 | Convention-first discovery | Try conventional names first (zero cost). Empty result from a query that *should* have data? → Don't conclude "doesn't exist." Discover via `label_names` / `metric_names` / `attribute_names` → adapt → store discovered mapping in Session State. |
 | Dependency direction | **Upstream** = services this service receives requests FROM (callers). **Downstream** = services this service sends requests TO (callees). |
@@ -612,10 +630,11 @@ KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its 
                 budget-extension note and continue (see Operating Constraints). Hard ceiling 25.
                 AND last query had non-zero Δ-Quality. Δ-Quality = ZERO when ALL hypothesis
                 states are unchanged AND no new hypothesis formed AND no root cause first
-                identified. Two consecutive Δ-Quality ZERO queries → STOP regardless of
-                remaining budget. Inconclusive signal accumulating without resolution = budget waste.
+                identified. Two consecutive Δ-Quality ZERO queries → 🛑 HALT regardless of
+                remaining budget and transition to `S4_RESOLUTION (BLOCKED)`. Inconclusive
+                signal accumulating without resolution = budget waste.
 BLOCKED FORMAT: "[BLOCKED: {signal}] — missing: {what}. Strategies tried: {list}."
-                Use after 2+ recovery strategies fail on an instrumentation gap.
+                Use after 2+ recovery strategies fail on an instrumentation gap, or Δ-Quality hits 0 twice.
                 When marked BLOCKED: add [signal, backend] to Session State instrumentation_gaps.
 NOTE: [INSTRUMENTATION_GAP] = Signal Coverage row marker (Step 4 tracking).
       [BLOCKED] = completion-level output tag (this contract).
