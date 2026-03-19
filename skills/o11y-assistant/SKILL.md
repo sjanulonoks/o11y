@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.59
+version: 0.60
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -62,7 +62,7 @@ Evidence-based investigation across **all available** observability signals. Sin
 - `S0_DISCOVERY`: Map available data sources (Step 0 - 0.5). **Entry declaration:** emit `[S0_DISCOVERY] service=<name|TBD> window=<start–end>`
 - `S1_HYPOTHESIS`: Generate mathematically testable claims (Step 1 - 3). **Entry declaration:** emit `[S1_HYPOTHESIS] mode=<TBD|TRIAGE|STANDARD|DEEP DIVE> constraint=<value|None> hypotheses=<N>`
 - `S2_EXECUTION`: Execute queries; prioritize `ctx_batch_execute` for high-cardinality processing to protect context (Step 4, 6, 7). **Entry declaration:** emit `[S2_EXECUTION] sequence=<Metrics→Traces→Logs|...> lead_hypothesis=<H#>`
-- `S3_VERIFICATION`: Apply Telemetry Calculus & ΔT temporal proof (Step 4.5, 5). **Entry declaration:** emit `[S3_VERIFICATION] causal_depth=<0|1|2> verdict_candidate=<ROOT CAUSE|FACTOR|NONE>`
+- `S3_VERIFICATION`: Apply Telemetry Calculus & ΔT temporal proof (Step 4.5, 5). **Entry declaration:** emit `[S3_VERIFICATION (pass N)] causal_depth=<0|1|2> verdict_candidate=<ROOT CAUSE|FACTOR|NONE>`  (increment N each time Step 4.5 is entered; resets to 1 on new investigation)
 - `S4_RESOLUTION`: Construct strict output schema (Step 8). **Entry declaration:** emit `[S4_RESOLUTION] output_mode=<TRIAGE|STANDARD|DEEP DIVE|NO ANOMALY|CONFLICT|GAP>`
 
 ---
@@ -106,9 +106,10 @@ Budget extensions: 0 of 1 allowed
 Budget regime:     NORMAL   ← NORMAL: below ceiling | EXTENDED: extension note emitted | FINAL: second ceiling hit → S4_RESOLUTION immediately
 Causal depth:      0   ← increment at Step 4.5 item 8 each time "One level deeper" fires; at 2 → emit [CAUSAL DEPTH: MAX]
 Dependencies:      dependency_probe=[true|false]
-                   known_dependencies={upstream: [...], downstream: [...]}
+                   known_dependencies={upstream: [...], downstream: [...], source: "", discovered: "<session-ts>"}
 History:           history_pending=[true|false]
-Instrumentation gaps: []   ← populate with [signal, backend] when 🔲 confirmed; check at Step 0.5 on re-investigation
+Instrumentation gaps: []   ← [{signal: "", backend: "", discovered: "<session-ts>"}]
+  Re-verification rule: If gap.discovered ≠ current session-ts → probe the gap first at Step 0.5 before treating as current. If still absent → confirm persists; if resolved → remove from list.
 ─────────────────────────────────────────────────────
 ```
 
@@ -226,7 +227,7 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 | Traces | Tempo | ✅/⬜/🔲 | FULL/PARTIAL/N/A | [summary or —] |
 | Logs | Loki | ✅/⬜/🔲 | FULL/PARTIAL/N/A | [summary or —] |
 ```
-(✅ = checked | ⬜ = not yet | 🔲 = INSTRUMENTATION_GAP | Depth: FULL = ≥1 confirming query AND ≥1 explicit falsifying-attempt query for this tier's active hypothesis · PARTIAL = confirming only, no falsifying attempt · N/A = tier unavailable)
+(✅ = checked | ⬜ = not yet | 🔲 = INSTRUMENTATION_GAP | Depth: FULL = ≥1 confirming query AND ≥1 falsifying-attempt query targeting the **opposite condition** of the confirmed hypothesis [e.g., confirmed "memory high at OOM" → falsifying-attempt = "memory at baseline during same window"] · PARTIAL = confirming only · N/A = tier unavailable)
 
 **Completeness gate:** Step 8 output is incomplete until Signal Coverage shows ✅ or 🔲 for every signal relevant to the active hypotheses, AND Depth = FULL or N/A for all ACTIVE hypotheses.
 
@@ -442,7 +443,8 @@ For past-incident queries: set window around incident time ±15 min.
    **Environment calibration — sense before proceeding:**
    - Any tier `none`? → mark it 🔲 UNAVAILABLE in Signal Coverage immediately. Skip its steps.
    - Any unfamiliar datasource type (not prometheus/loki/tempo/cloudwatch/clickhouse/mimir)?
-     → call `get_query_examples(DatasourceType=<type>)` BEFORE querying it. Treat as unknown backend.
+     → call `get_query_examples(DatasourceType=<type>)` BEFORE querying it.
+     **Unknown backend grade rule:** All findings from this backend default to `WEAK` until cross-validated by a finding from a known backend. State: `[UNKNOWN BACKEND: graded WEAK pending cross-check]`
    - All tiers `none` or all types unrecognizable? → trigger Autonomy Rule pause (state what IS available).
    - Only 1 signal type available? → state constraint explicitly: "Investigation scope limited to
      [type] — [missing types] not available in this environment."
@@ -457,6 +459,7 @@ For past-incident queries: set window around incident time ±15 min.
    - `get_annotations(From=<start_ms>, To=<end_ms>)` → deployment markers, maintenance windows
 3. **Alert quality check:** Weigh recently-transitioned `firing` alerts higher than long-standing or high-frequency alerts. Check `for` duration — a `1m` alert fires on noise, a `15m` alert fires on sustained issues.
 4. Note severity impression: `Severity: [LOW/MEDIUM/HIGH/CRITICAL]` (from alert state + blast radius). Store in Session State.
+   **Annotation candidate shortcut:** If an annotation (deploy/config/restart) has timestamp < symptom onset → add to Session State: `annotation_candidate: {type: "deploy", time: "<ts>", label: "<text>"}`. In Step 4.5, inject into `Timing & Spatial Proof`: "Annotation `<label>` at `<ts>` precedes symptom by ΔT." This seeds — but does not conclude — temporal causality.
 
 5. **Decision:**
    - Firing alerts found? → Correlate with symptoms. Use alert labels as service discovery seed. If alerts fully explain symptom → Step 8 (TRIAGE).
@@ -535,6 +538,7 @@ Discovery method: [conventional | discovered via label_names]
 **If `known_dependencies` populated:** Consider querying upstream service metrics before deeper tiers on target — confirming upstream failure is cheaper than diagnosing downstream symptoms. State: "Checking [upstream] first because [trigger signal]."
 
 **Hypothesis count gate:** If ≥5 ACTIVE hypotheses at Step 3 entry → REFUTE ≥2 lowest-confidence hypotheses before querying. State: "Pruning H[N] (weakest evidence base): [1-line rationale]."
+**Exception:** A PRIOR DETECTED hypothesis is immune to pruning — it can be ranked last (P-12) but cannot be eliminated before being tested.
 
 **If ≥4 hypotheses ACTIVE:** Triage before querying — rank by: (1) highest evidence strength in favour, (2) cheapest signal tier to check, (3) highest blast radius if confirmed. State the ranking before proceeding. Do **not** distribute budget equally across all hypotheses.
 
@@ -562,6 +566,9 @@ Discovery method: [conventional | discovered via label_names]
    ONLY after 2+ strategies exhausted → mark `[INSTRUMENTATION_GAP]` in Signal Coverage + continue.
 9. Analyze: trend, spike, anomaly
 10. Extract 1–5 key findings → **update Hypothesis Tracker + Signal Coverage**
+    Each finding MUST include inline source tag: `[src: <tool_name> expr/query="..." → <key value>]`
+    Example: `Error rate 4.7% [src: query_prometheus expr="rate(http_errors[5m])" → 0.047]`
+    UNGROUNDED = finding emitted without src tag. Pre_output_verification Gate 2 checks for src tags.
 
 #### Backend-Specific Notes
 
@@ -575,7 +582,7 @@ Discovery method: [conventional | discovered via label_names]
 
 #### After Each Backend
 
-- Extract 1–5 key findings with Evidence Strength grade
+- Extract 1–5 key findings with Evidence Strength grade. Each finding must carry inline source tag: `[src: tool expr/query="..." → key value]`
 - **Critical check:** Does this evidence actually *explain* the symptom, or does it just *correlate*? What's the strongest counter-argument to the leading hypothesis?
 - Update/confirm/refute hypotheses. **If all hypotheses are ACTIVE after 2+ queries — your hypotheses may be wrong. Step back and form new ones.**
 - If 3 consecutive empty results → re-examine service name (wrong label? wrong time window?)
@@ -636,26 +643,31 @@ Anomaly: [description]
 
 **Drift check (RCoT):** Before evaluating the completion contract, reconstruct the user's original question from your current leading hypothesis. `ALIGNED` = hypothesis answers what was asked. `EXPANDED` = useful but broader — note it. `DRIFTED` = conclusion no longer addresses original question → reanchor before proceeding.
 
-**Epistemic State (mandatory before completion contract evaluation):**
-Emit: `[EPISTEMIC: KK=<bound symptom — what is factually established> | KU=<causal gap to fill> | UU=<uninstrumented void if any> | next_query=<backend: function: signal name>]`
-The `next_query` field MUST specify backend + function + signal name. "Check logs" is FORBIDDEN — "Loki: `query_loki_logs`: `{service="X"} |= "connection refused"`" is required.
+**Epistemic State (mandatory ONLY when path = KEEP GOING):**
+Emit: `[EPISTEMIC: KK=<bound symptom — what is factually established> | KU=<causal gap to fill> | UU=<uninstrumented void if any> | next_query=<backend: function: label-filter>]`
+The `next_query` field MUST specify backend + function + label selector/attribute filter. "Check logs" is FORBIDDEN — `Loki: query_loki_logs: {service="X"} |= "connection refused"` is required. Do NOT emit this block when path = DONE.
 
 <completion_contract>
 DONE WHEN:      All active hypotheses CONFIRMED or REFUTED, AND Signal Coverage shows
                 ✅ or 🔲 for every signal (no ⬜ remains) relevant to active hypotheses.
-KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its status
-                — name the backend + query before proceeding. If you can’t name it, STOP.
+BUDGET FINAL
+OVERRIDE:       If `Budget regime = FINAL` → proceed to Step 8 immediately.
+                This overrides ALL KEEP GOING conditions. State: `[BUDGET FINAL: synthesizing from current evidence]`
+KEEP GOING IF:  Budget regime ≠ FINAL, AND ≥1 hypothesis is ACTIVE AND a specific query
+                would change its status — name the backend + query before proceeding.
                 AND Step 4.5 CAUSAL VALIDATION block has been emitted for any ROOT CAUSE
                 candidate found so far (do not proceed to Step 8 without it).
                 AND within budget ceiling for active mode (STANDARD ≤8 / DEEP DIVE ≤15;
                 EXPLORE/VALIDATE ≤5). Budget ceiling reached AND Δ-Quality >0 → emit
                 budget-extension note and continue (see Operating Constraints). Hard ceiling 25.
                 AND last query had non-zero Δ-Quality. Δ-Quality = ZERO when ALL hypothesis
-                states are unchanged AND no new hypothesis formed AND no root cause first
-                identified. Two consecutive Δ-Quality ZERO queries → 🛑 HALT regardless of
-                remaining budget and transition to `S4_RESOLUTION (BLOCKED)`. Inconclusive
-                signal accumulating without resolution = budget waste.
-BLOCKED FORMAT: "[BLOCKED: {signal}] — missing: {what}. Strategies tried: {list}."
+                states are unchanged AND no new hypothesis seeded by most-recent query findings
+                AND no root cause first identified. Hypothesis formed from prior evidence only
+                (not from the most recent query) does NOT reset the Δ-Quality counter.
+                Two consecutive Δ-Quality ZERO queries → 🛑 HALT and transition to `S4_RESOLUTION (BLOCKED)`.
+                Mid-investigation hypothesis gate: If ≥5 ACTIVE hypotheses at this evaluation
+                → REFUTE ≥1 lowest-confidence hypothesis before querying. State rationale.
+BLOCKED FORMAT: "[BLOCKED: {signal}] — missing: {what}. Strategies tried: {specific query that failed}."
                 Use after 2+ recovery strategies fail on an instrumentation gap, or Δ-Quality hits 0 twice.
                 When marked BLOCKED: add [signal, backend] to Session State instrumentation_gaps.
 NOTE: [INSTRUMENTATION_GAP] = Signal Coverage row marker (Step 4 tracking).
