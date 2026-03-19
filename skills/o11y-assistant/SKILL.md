@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.57
+version: 0.58
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -30,6 +30,7 @@ reasoning_effort: >
 - `--history` → Load `resolutions/<service>.md` at Step 1. Use past outcomes + blind spots as hypothesis seeds. MUST form contradicting hypothesis. @see library/history.md for details.
 - **(DEFAULT) grade active** → After Step 8: invoke grade protocol (@see library/grade.md). Suppress with `--no-grade`.
 - `--review <service>` → Standalone (no active investigation). Analyze accumulated entries, distill patterns, compact-rewrite `resolutions/<service>.md`. @see library/review.md
+- `--review-cross <svc-A> [<svc-B> ...]` → Standalone. Cross-service pattern analysis: shared root causes, cascade patterns, systemic blind spots across multiple services. @see library/review-cross.md
 - `--topology <service>` → Standalone. Extract service topology map from accumulated grade entries. @see library/topology.md
 
 ## Core Principle
