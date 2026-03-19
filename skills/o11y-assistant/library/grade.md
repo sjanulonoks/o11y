@@ -33,3 +33,33 @@ Resolve `<service>` from Session State.
 Create `resolutions/` directory and file if first time.
 Check existing entries for novelty — skip if this is a duplicate root cause
 AND no new blind spots or findings.
+
+## Phase 4: Machine-Readable Schema (append after prose block)
+
+After the prose block, append a YAML entry for automated analysis by `--review` and `--topology`:
+
+```yaml
+# grade-entry
+date: <UTC timestamp>
+investigation_id: <sha1 of service+symptom+window>
+mode: <TRIAGE|STANDARD|DEEP DIVE>
+root_cause: <verdict text — 1 sentence>
+evidence_grade: <STRONG|MODERATE|WEAK>
+hypotheses_formed: <N>
+hypotheses_refuted: <N>
+backends_queried: [<prometheus|loki|tempo|...>]
+queries_used: <N>
+budget_ceiling: <N>
+delta_quality_zeros: <N>
+user_verdict: <correct|partial|wrong|unknown>
+black_boxes: [<text>, ...]
+resolution_applied: <text|unknown>
+upstream_causes: [<service-name>, ...]
+downstream_affected: [<service-name>, ...]
+tripartite:
+  trigger: <text>
+  vulnerability: <text>
+  precondition: <text|none>
+```
+
+**Uniqueness rule:** If an entry with the same `investigation_id` exists, overwrite it (idempotent re-grade).

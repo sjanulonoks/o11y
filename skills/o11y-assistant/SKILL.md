@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.56
+version: 0.57
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -28,8 +28,9 @@ reasoning_effort: >
 
 **Flags (user can invoke at any point in conversation):**
 - `--history` → Load `resolutions/<service>.md` at Step 1. Use past outcomes + blind spots as hypothesis seeds. MUST form contradicting hypothesis. @see library/history.md for details.
-- `--grade` → After Step 8: self-assess quality, ask user for outcome verdict, append to `resolutions/<service>.md`. @see library/grade.md
+- **(DEFAULT) grade active** → After Step 8: invoke grade protocol (@see library/grade.md). Suppress with `--no-grade`.
 - `--review <service>` → Standalone (no active investigation). Analyze accumulated entries, distill patterns, compact-rewrite `resolutions/<service>.md`. @see library/review.md
+- `--topology <service>` → Standalone. Extract service topology map from accumulated grade entries. @see library/topology.md
 
 ## Core Principle
 
@@ -57,11 +58,11 @@ Evidence-based investigation across **all available** observability signals. Sin
 **FAILS:** When Signal Landscape implies tiers that are misconfigured, or when `Δ-Quality` metrics drop to 0 for two consecutive steps.
 **RELATES:** Connects `alert` to `node_metric` to `trace_path` to `log_exception`. 
 **STATE_TRANSITIONS:**
-- `S0_DISCOVERY`: Map available data sources (Step 0 - 0.5).
-- `S1_HYPOTHESIS`: Generate mathematically testable claims (Step 1 - 3).
-- `S2_EXECUTION`: Execute queries; prioritize `ctx_batch_execute` for high-cardinality processing to protect context (Step 4, 6, 7).
-- `S3_VERIFICATION`: Apply Telemetry Calculus & ΔT temporal proof (Step 4.5, 5).
-- `S4_RESOLUTION`: Construct strict output schema (Step 8).
+- `S0_DISCOVERY`: Map available data sources (Step 0 - 0.5). **Entry declaration:** emit `[S0_DISCOVERY] service=<name|TBD> window=<start–end>`
+- `S1_HYPOTHESIS`: Generate mathematically testable claims (Step 1 - 3). **Entry declaration:** emit `[S1_HYPOTHESIS] mode=<TBD|TRIAGE|STANDARD|DEEP DIVE> constraint=<value|None> hypotheses=<N>`
+- `S2_EXECUTION`: Execute queries; prioritize `ctx_batch_execute` for high-cardinality processing to protect context (Step 4, 6, 7). **Entry declaration:** emit `[S2_EXECUTION] sequence=<Metrics→Traces→Logs|...> lead_hypothesis=<H#>`
+- `S3_VERIFICATION`: Apply Telemetry Calculus & ΔT temporal proof (Step 4.5, 5). **Entry declaration:** emit `[S3_VERIFICATION] causal_depth=<0|1|2> verdict_candidate=<ROOT CAUSE|FACTOR|NONE>`
+- `S4_RESOLUTION`: Construct strict output schema (Step 8). **Entry declaration:** emit `[S4_RESOLUTION] output_mode=<TRIAGE|STANDARD|DEEP DIVE|NO ANOMALY|CONFLICT|GAP>`
 
 ---
 
@@ -101,6 +102,7 @@ Severity:          [LOW|MEDIUM|HIGH|CRITICAL]
 Mode:              [TBD|TRIAGE|STANDARD|DEEP DIVE]   ← set at Step 1 once Signal Landscape known
 Budget:            0 analytical queries / [3|8|15] ceiling
 Budget extensions: 0 of 1 allowed
+Causal depth:      0   ← increment at Step 4.5 item 8 each time "One level deeper" fires; at 2 → emit [CAUSAL DEPTH: MAX]
 Dependencies:      dependency_probe=[true|false]
                    known_dependencies={upstream: [...], downstream: [...]}
 History:           history_pending=[true|false]
@@ -213,16 +215,16 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 | 1 | [statement] | [findings] | [findings] | STRONG/MOD/WEAK | ACTIVE/CONFIRMED/REFUTED |
 
 ## SIGNAL COVERAGE
-| Signal | Backend | Status | Finding |
-|--------|---------|--------|---------|
-| Alerts | Grafana | ✅/⬜/🔲 | [summary or —] |
-| Metrics | Prometheus | ✅/⬜/🔲 | [summary or —] |
-| Traces | Tempo | ✅/⬜/🔲 | [summary or —] |
-| Logs | Loki | ✅/⬜/🔲 | [summary or —] |
+| Signal | Backend | Status | Depth | Finding |
+|--------|---------|--------|-------|---------|
+| Alerts | Grafana | ✅/⬜/🔲 | FULL/PARTIAL/N/A | [summary or —] |
+| Metrics | Prometheus | ✅/⬜/🔲 | FULL/PARTIAL/N/A | [summary or —] |
+| Traces | Tempo | ✅/⬜/🔲 | FULL/PARTIAL/N/A | [summary or —] |
+| Logs | Loki | ✅/⬜/🔲 | FULL/PARTIAL/N/A | [summary or —] |
 ```
-(✅ = checked | ⬜ = not yet | 🔲 = INSTRUMENTATION_GAP)
+(✅ = checked | ⬜ = not yet | 🔲 = INSTRUMENTATION_GAP | Depth: FULL = hypothesis parameter space covered · PARTIAL = some dimensions checked · N/A = tier unavailable)
 
-**Completeness gate:** Step 8 output is incomplete until Signal Coverage shows ✅ or 🔲 for every signal relevant to the active hypotheses.
+**Completeness gate:** Step 8 output is incomplete until Signal Coverage shows ✅ or 🔲 for every signal relevant to the active hypotheses, AND Depth = FULL or N/A for all ACTIVE hypotheses.
 
 ---
 
@@ -440,7 +442,11 @@ For past-incident queries: set window around incident time ±15 min.
    - All tiers `none` or all types unrecognizable? → trigger Autonomy Rule pause (state what IS available).
    - Only 1 signal type available? → state constraint explicitly: "Investigation scope limited to
      [type] — [missing types] not available in this environment."
-2. **Environment Handshake:** Before making deep architectural queries, execute a TRIAGE volume query on ALL available datastores (Logs, Metrics, Traces) for the target timeframe. If any store returns 0 results for *baseline* traffic, mark it `[OFFLINE]`. Query ONLY online datastores in Step 4.
+2. **Environment Handshake:** Before deep architectural queries, execute a **volume baseline probe** on ALL available datastores for the target timeframe:
+   - Metrics: `query_prometheus(expr="up{}", queryType="instant")` — any result = ONLINE
+   - Logs: `query_loki_stats(logql="{}")` — entries > 0 = ONLINE
+   - Traces: `tempo_traceql-metrics-instant(query="count_over_time({} [5m])")` — result > 0 = ONLINE
+   If any store returns 0 results for baseline traffic → mark `[OFFLINE]`. Query ONLY online datastores in Step 4.
    - *Override Protocol:* If the User Constraint yields 0 anomalous results in the Initial Handshake, assume the user provided the wrong timestamp or service. Auto-expand the time window 4x and strip the service filter.
 3. **Parallel calls (both safe):**
    - `list_alert_rules(datasourceUid=..., limit=1000)` → Filter by `state="firing"` (client-side)
@@ -466,6 +472,7 @@ For past-incident queries: set window around incident time ±15 min.
 - Apply Known Failure Pattern fast-path (see below) — if matched, shortcut to indicated tier
 - **Null Hypothesis Start:** Formulate hypotheses ONLY AFTER completing the initial Triage volume queries in Step 4.
 - **Instrumentation hypothesis (always form):** "Is this environment's signal coverage sufficient to answer the question?" If Signal Landscape has any `none` or UNAVAILABLE tier, add to Hypothesis Tracker: "Root cause may reside in a signal type not exposed by this environment [INSTRUMENTATION_GAP risk]." This is not defeatism — it pre-arms the investigation against silent blind spots.
+  *Auto-resolve rule:* If Signal Coverage shows ✅ (data found) for ALL tiers present in the Signal Landscape AND all tiers produce non-empty, non-void results for the target service → auto-REFUTE this hypothesis and note: `"Instrumentation hypothesis REFUTED: all available tiers returned data for service [X]."`
 - State chosen investigation sequence AFTER service confirmed: "Starting with Metrics (latency issue). If inconclusive → Traces."
 - **Ask yourself:** "If my first hypothesis is wrong, what would the evidence look like?" — this shapes what to query.
 - **`--history` active?** Load `resolutions/<service>.md`. If file has a `## Distilled Patterns` section (written by `--review`), use patterns directly. Otherwise scan most recent 5 entries. Add most recent historical root cause as hypothesis. MUST form >=1 contradicting hypothesis ("what if it's NOT [past cause]?"). Past **blind spots** and **user corrections** are highest-priority hypothesis seeds. If service unknown pre-Step 2, defer: set `history_pending=true` in Session State, load after Step 2 resolves service name. History informs — never shortcuts discovery. @see library/history.md
@@ -542,7 +549,9 @@ Discovery method: [conventional | discovered via label_names]
 8. **`<tool_persistence_rules>`:** A first empty result MUST trigger persistence protocols. Retry with:
    (a) alternate label/metric/attribute name, (b) broader time range (2×) — **run volume estimate first** (`query_loki_stats` for logs, `count_over_time` for metrics) before expanding; if volume is low, expand range rather than label, (c) label discovery fallback.
    (d) **Void Proof:** If persistent 0 results, query backend health metrics (e.g., Loki stats, Tempo up status). If pipeline is unhealthy/dropping data, mark `[AMBIGUOUS VOID]` instead of NO ANOMALY.
-   (e) **Context Breaker:** After every 3 tool calls without a ROOT CAUSE, you MUST explicitly output a compressed 3-bullet summary of your current hypothesis state before querying again, to prevent context dilution.
+   (e) **5-Signal Checkpoint:** After every 5 analytical queries without a ROOT CAUSE, emit:
+   `[CHECKPOINT] State=<S0-S4> | Budget=<N/ceil> | Lead=<H#, grade> | Gap=<what next query changes> | Query=<backend: type>`
+   This forces DFA state awareness and hypothesis focus before the next query.
    ONLY after 2+ strategies exhausted → mark `[INSTRUMENTATION_GAP]` in Signal Coverage + continue.
 9. Analyze: trend, spike, anomaly
 10. Extract 1–5 key findings → **update Hypothesis Tracker + Signal Coverage**
@@ -591,7 +600,7 @@ For each detected anomaly:
 7. **Coincidence check** — Did X start BEFORE the symptom? Is the magnitude proportional?
    *Proportional: anomaly in X is directionally consistent AND ≥30% of the symptom’s relative magnitude vs pre-incident baseline. State both numbers explicitly.*
    *(Evidence Sufficiency: ROOT CAUSE declaration REQUIRES causal/saturation evidence beyond just identifying a dependency.)*
-8. **One level deeper (2× max)** — "Why did X happen?" If the answer points to another system, THAT is the root cause candidate. Apply at most twice — if causal chain still leads outward after 2 levels → declare `[SYSTEMIC ROOT CAUSE: N layers]` naming all layers. Recurse MAXIMUM 2 levels.
+8. **One level deeper (2× max)** — "Why did X happen?" If the answer points to another system, THAT is the root cause candidate. Apply at most twice — if causal chain still leads outward after 2 levels → declare `[SYSTEMIC ROOT CAUSE: N layers]` naming all layers. Recurse MAXIMUM 2 levels. **Increment `Causal depth` in Session State after each application. At depth=2 → emit `[CAUSAL DEPTH: MAX]` and proceed to verdict immediately.**
 9. **Epistemic State Check** (Universal): Acknowledge Diagnostic Gaps (KU) as a broken causal chain requiring immediate traversal. Actively flag The Void (UU) when expected signals vanish across boundaries (e.g. Rate-Limiting Drop), recognizing this structural absence as the necessary deductive bridge to the final root cause.
 10. **Feedback Loop Detection**: If Request Rate and Duration/Errors spike concurrently, explicitly hypothesize a feedback loop (e.g., "Retry Storm" or "Thundering Herd"). Look for retries from upstream or backoff failures.
 
@@ -625,6 +634,8 @@ DONE WHEN:      All active hypotheses CONFIRMED or REFUTED, AND Signal Coverage 
                 ✅ or 🔲 for every signal (no ⬜ remains) relevant to active hypotheses.
 KEEP GOING IF:  ≥1 hypothesis is ACTIVE AND a specific query would change its status
                 — name the backend + query before proceeding. If you can’t name it, STOP.
+                AND Step 4.5 CAUSAL VALIDATION block has been emitted for any ROOT CAUSE
+                candidate found so far (do not proceed to Step 8 without it).
                 AND within budget ceiling for active mode (STANDARD ≤8 / DEEP DIVE ≤15;
                 EXPLORE/VALIDATE ≤5). Budget ceiling reached AND Δ-Quality >0 → emit
                 budget-extension note and continue (see Operating Constraints). Hard ceiling 25.
