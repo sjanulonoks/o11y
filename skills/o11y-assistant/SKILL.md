@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.62
+version: 0.63
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -50,20 +50,9 @@ Evidence-based investigation across **all available** observability signals. Sin
 
 ---
 
-## Interface Contract (The 7 Questions)
+## DFA State Declarations
 
-**WHAT:** Diagnoses systemic anomalies by calculating spatial bounds and temporal correlation (ΔT) across observability backends.
-**WHEN:** Triggered by user alert queries, observed anomalies, or system degradation reports.
-**NEEDS:** Time-bounded symptoms (or `T=0` anchor point), explicit user constraints.
-**PRODUCES:** Strict resolution state containing Tripartite Causality or defined escalation path.
-**FAILS:** When Signal Landscape implies tiers that are misconfigured, or when `Δ-Quality` metrics drop to 0 for two consecutive steps.
-**RELATES:** Connects `alert` to `node_metric` to `trace_path` to `log_exception`. 
-**STATE_TRANSITIONS:**
-- `S0_DISCOVERY`: Map available data sources (Step 0 - 0.5). **Entry declaration:** emit `[S0_DISCOVERY] service=<name|TBD> window=<start–end>`
-- `S1_HYPOTHESIS`: Generate mathematically testable claims (Step 1 - 3). **Entry declaration:** emit `[S1_HYPOTHESIS] mode=<TBD|TRIAGE|STANDARD|DEEP DIVE> constraint=<value|None> hypotheses=<N>`
-- `S2_EXECUTION`: Execute queries; prioritize `ctx_batch_execute` for high-cardinality processing to protect context (Step 4, 6, 7). **Entry declaration:** emit `[S2_EXECUTION] sequence=<Metrics→Traces→Logs|...> lead_hypothesis=<H#>`
-- `S3_VERIFICATION`: Apply Telemetry Calculus & ΔT temporal proof (Step 4.5, 5). **Entry declaration:** emit `[S3_VERIFICATION (pass N)] causal_depth=<0|1|2> verdict_candidate=<ROOT CAUSE|FACTOR|NONE>`  (increment N each time Step 4.5 is entered; resets to 1 on new investigation)
-- `S4_RESOLUTION`: Construct strict output schema (Step 8). **Entry declaration:** emit `[S4_RESOLUTION] output_mode=<TRIAGE|STANDARD|DEEP DIVE|NO ANOMALY|CONFLICT|GAP>`
+Emit at each phase transition: `[S0_DISCOVERY]`, `[S1_HYPOTHESIS]`, `[S2_EXECUTION]`, `[S3_VERIFICATION (pass N)]`, `[S4_RESOLUTION]` — with inline parameters as shown in Steps 0–8.
 
 ---
 
@@ -177,7 +166,7 @@ Tier 4 — Logs                query_loki_logs / equivalent         ★★★★
 | | Hard ceiling 25 applies regardless. Update Session State Budget field after every analytical query. |
 | Convention-first discovery | Try conventional names first (zero cost). Empty result from a query that *should* have data? → Don't conclude "doesn't exist." Discover via `label_names` / `metric_names` / `attribute_names` → adapt → store discovered mapping in Session State. |
 | Dependency direction | **Upstream** = services this service receives requests FROM (callers). **Downstream** = services this service sends requests TO (callees). |
-| Analytical query boundary | **ANALYTICAL** (count toward budget) = any query whose result directly changes a Hypothesis Tracker status OR produces a Finding for Step 8. **NOT ANALYTICAL (free):** `list_datasources`, `list_alert_rules`, `get_annotations`, `datetime_get_current_time`, `list_*_label_names`, `list_*_label_values`, `search_dashboards`, `get_dashboard_summary`, `query_prometheus(expr="up{}", queryType="instant")` when used as Environment Handshake baseline only, `query_loki_stats` when used for volume estimation before analytical query, `get_query_examples`, `generate_deeplink`. FORBIDDEN: classifying analytical queries as free to stay under budget. After each query, state: `Budget: +1 (analytical)` or `Budget: +0 (metadata)`. |
+| Analytical query boundary | **ANALYTICAL** (budget +1) = any query that changes a Hypothesis Tracker status OR produces a Finding for Step 8. All other queries (discovery, label resolution, metadata, volume estimation, health checks) are **free** (budget +0). FORBIDDEN: classifying analytical queries as free to stay under budget. After each query, state: `Budget: +1 (analytical)` or `Budget: +0 (metadata)`. |
 
 ### Parallelism Policy
 
@@ -494,9 +483,9 @@ For past-incident queries: set window around incident time ±15 min.
   *Auto-resolve rule:* If Signal Coverage shows ✅ (data found) for ALL tiers present in the Signal Landscape AND all tiers produce non-empty, non-void results for the target service → auto-REFUTE this hypothesis and note: `"Instrumentation hypothesis REFUTED: all available tiers returned data for service [X]."`
 - State chosen investigation sequence AFTER service confirmed: "Starting with Metrics (latency issue). If inconclusive → Traces."
 - **Ask yourself:** "If my first hypothesis is wrong, what would the evidence look like?" — this shapes what to query.
-- **`--history` active?** Load `resolutions/<service>.md`. **If file does not exist:** emit `[HISTORY: no prior sessions for <service> — operating without historical context]` and proceed without historical seeds (do NOT set `history_pending=true`; file will not appear in Step 2). If file exists: if it has a `## Distilled Patterns` section (written by `--review`), use patterns directly. Otherwise scan most recent 5 entries. Add most recent historical root cause as hypothesis. MUST form ≥1 contradicting hypothesis ("what if it's NOT [past cause]?"). Past **blind spots** and **user corrections** are highest-priority hypothesis seeds. If service unknown pre-Step 2, defer: set `history_pending=true` in Session State, load after Step 2 resolves service name. History informs — never shortcuts discovery. @see library/history.md
+- **`--history` active?** Load history for service and seed hypotheses. If service unknown pre-Step 2, defer: set `history_pending=true`. @see library/history.md
 - **Dependency signal check:** If ANY present → set `dependency_probe=true` in Session State: (1) user mentions upstream/downstream/cascading/dependency or names multiple services, (2) cross-service alerts firing in Step 0.5, (3) --history shows past multi-service causes, (4) dashboards reference multiple services, (5) multi-service deploys in annotations. Add hypothesis: "upstream dependency may have caused symptom in [target service]."
-  **Topology shortcut:** If `dependency_probe=true` AND `resolutions/<service>.md` exists with YAML grade-entries containing `upstream_causes` or `downstream_affected` fields → extract known dependencies directly. State: `[TOPOLOGY SHORTCUT: upstream=[list], downstream=[list] from N grade entries]`. Store in Session State `known_dependencies`. Skip Dependency Discovery Cascade at Step 2 unless trace data contradicts these known dependencies.
+  **Topology shortcut (if `dependency_probe=true`):** Check historical dependencies from grade entries. @see library/topology.md. Store results in Session State `known_dependencies`.
 - **Set Mode in Session State (INVESTIGATE paths):**
   TRIAGE → firing alert fully explains symptom → exit to Step 8 directly (0 analytical queries).
   DEEP DIVE → ≥3 backends expected, multi-service scope, or contradicting hypotheses from the start.
@@ -668,8 +657,6 @@ OVERRIDE:       If `Budget regime = FINAL` → proceed to Step 8 immediately.
                 This overrides ALL KEEP GOING conditions. State: `[BUDGET FINAL: synthesizing from current evidence]`
 KEEP GOING IF:  Budget regime ≠ FINAL, AND ≥1 hypothesis is ACTIVE AND a specific query
                 would change its status — name the backend + query before proceeding.
-                AND Step 4.5 CAUSAL VALIDATION block has been emitted for any ROOT CAUSE
-                candidate found so far (do not proceed to Step 8 without it).
                 AND within budget ceiling for active mode (STANDARD ≤8 / DEEP DIVE ≤15;
                 EXPLORE/VALIDATE ≤5). Budget ceiling reached AND Δ-Quality >0 → emit
                 budget-extension note and continue (see Operating Constraints). Hard ceiling 25.
@@ -707,14 +694,7 @@ Now checking [BACKEND 2]. Service appears as: [label=value]
 
 ### Step 8: Synthesize & Output (Adaptive Depth)
 
-<pre_output_verification>
-Before emitting Step 8 output (ALL paths — TRIAGE, STANDARD, DEEP DIVE, and non-INVESTIGATE modes):
-1. Correctness:   Does output answer the original user question?
-2. Grounding:     Every claim traceable to a named tool call and returned value? (unattributed = [INFERENCE])
-3. Format:        Does output match the <output_contract> for the active mode?
-4. Completeness:  Signal Coverage shows ✅ or 🔲 for all active hypothesis signals?
-If any step fails → return to earliest failing step before outputting.
-</pre_output_verification>
+
 
 **The Self-Healing Clause:** For incidents that show a clear return to baseline within the investigation window, the output MUST identify the exact time of recovery and systematically correlate it with any resolving actions found in annotations (e.g., pod restarts, reverts, auto-scaling).
 
@@ -754,7 +734,6 @@ Root cause section MUST embed the CAUSAL VALIDATION block verbatim (not by refer
   ## Root Cause
   [CAUSAL VALIDATION block verbatim — all fields including Verdict]
   Evidence summary: [1 sentence]
-  Referencing by position ("see Step 4.5 above") is FORBIDDEN.
 Optional: contributing-factors (≤2 bullets; include ONLY if ≥1 MODERATE finding is distinct from root cause and actionable), involved-architecture (list specific nodes discovered via breadcrumbs).
 Omit: evidence-appendix (→ use DEEP DIVE for 3+ backend incidents).
 ruled-out (required): for each REFUTED hypothesis, name the specific evidence that refuted it — 1 line max per hypothesis.
@@ -780,7 +759,7 @@ unmapped-anomalies (required): list any verified anomalies that DO NOT logically
 <output_contract: DEEP DIVE>
 Required sections (in order): summary, timeline, evidence, root-cause, contributing-factors, involved-architecture, evidence-appendix, ruled-out, unmapped-anomalies
 Optional: further-investigation (include ONLY if SPECULATIVE findings exist — state the signal that would confirm each one).
-Root cause MUST reference CAUSAL VALIDATION. Contributing factors MUST have Evidence Strength grade.
+Contributing factors MUST have Evidence Strength grade.
 ruled-out (required): for each REFUTED hypothesis, name the specific evidence that refuted it — 1 line max per hypothesis.
 unmapped-anomalies (required): list any verified anomalies that DO NOT logically fit into the confirmed root cause or contributing factors.
 Multi-service: if root cause is in upstream service X, prefix output header: "⛓️ [TargetService] ← upstream: [RootCauseService]"; root-cause section describes [RootCauseService].
@@ -802,7 +781,10 @@ Required sections (in order): status-line, checked, possible-explanations, ruled
 Minimum query gate (MANDATORY): NO ANOMALY is FORBIDDEN if Signal Coverage shows ⬜ for any backend present in Signal Landscape.
   All available backends must show ✅ (checked healthy) or 🔲 (confirmed unavailable) — no ⬜ (unchecked) permitted.
   If any ⬜ remains → query the backend first OR explicitly mark it 🔲 with rationale before emitting NO ANOMALY.
-Use this format ONLY IF all queried backends are confirmed fully instrumented and healthy.
+Variant — INSTRUMENTATION_GAP: If Signal Coverage shows 🔲 for ≥50% of available backends:
+  Replace status-line with: "🔍 [Service]: Investigation incomplete — instrumentation gap"
+  Add section: "Gap: [signal type] — likely not instrumented. Recommendation: [specific instrumentation]."
+  Add section: "Unresolved hypotheses: [ACTIVE hypotheses that could not be tested]."
 </output_contract>
 
 ✅ [Service]: No anomalies detected in [window]
@@ -833,20 +815,6 @@ Evidence A: [specific query + result]
 Evidence B: [specific query + result]
 Most likely explanation: [cardinality mismatch | sampling rate difference | clock skew | label scope difference]
 Resolution: run [specific query or action] to determine which reading is authoritative
-```
-
-#### INSTRUMENTATION_GAP Format
-*Use when evidence is absent because the signal type is not instrumented / not accessible, not because the system is healthy.*
-```
-<output_contract: INSTRUMENTATION_GAP>
-Required sections (in order): status-line, checked, gap-description, recommendation, unresolved-hypotheses
-</output_contract>
-
-🔍 [Service]: Investigation incomplete — instrumentation gap
-Checked: [backends queried with their findings]
-Gap: [signal type] returned no data after [N] discovery attempts — likely not instrumented
-Recommendation: add [specific exporter/instrumentation] to cover [gap]
-Cannot confirm or rule out: [hypotheses that remain ACTIVE due to missing signal]
 ```
 
 **RULE:** Destructive actions REQUIRE explicit human confirmation via --ask-user.
