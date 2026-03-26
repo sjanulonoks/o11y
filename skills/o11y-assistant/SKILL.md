@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.66
+version: 0.66.1
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -520,7 +520,7 @@ Discovery method: [conventional | discovered via label_names]
     Example: `Error rate 4.7% [src: query_prometheus expr="rate(http_errors[5m])" → 0.047]`
     UNGROUNDED = finding emitted without src tag. Pre_output_verification Gate 2 checks for src tags.
 
-**Backend-specific guidance:** @see library/tools.md — each backend section includes usage notes, mandatory checks, and baseline strategies.
+**Backend-specific guidance:** @see library/tools.md — load backend section before querying. **Tempo sampling rule (inline):** `with(sample=true)` MUST appear at END of pipeline, after the last pipe stage: `{ selector } | rate() with(sample=true)` ✅ — NOT after selector alone: `{ selector } with(sample=true) | rate()` ❌. If a TraceQL query errors mentioning `with(...)`, correct placement and retry before abandoning sampling.
 
 #### After Each Backend
 
@@ -731,6 +731,7 @@ When MCP tools fail (timeout, datasource unreachable, unexpected error):
 2. **If persistent:** Document failure in Session State, note which signal type is unavailable
 3. **Adapt:** Continue investigation with remaining backends. Mention gap in Step 8.
 4. Base conclusions ONLY on successful tool outputs. State: "Unable to query [signal type]: [error]"
+5. **TraceQL `with(...)` syntax error:** If Tempo returns a syntax error mentioning `with(sample=true)` or `with(span_sample=...)` — do NOT fall back to non-sampling queries. MANDATORY: check that `with(...)` appears at the END of the pipeline (after last `| operation`), correct position, and retry exactly once. Abandoning sampling without this retry is FORBIDDEN.
 
 ---
 
