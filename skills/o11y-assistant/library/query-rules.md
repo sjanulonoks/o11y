@@ -65,6 +65,7 @@ Tempo stores data in Parquet. Cost = columns read × I/O. Only &&-only queries e
 🔴 =~ ".*text.*" (greedy)           GREEDY REGEX — replace with exact =
 🔴 { A } && { B } same-span intent  SPLIT SELECTOR — merge into single { }
 🔴 >> operator                       ANCESTOR TRAVERSAL — most expensive
+🔴 with(sample=...) before END       WRONG POSITION — must follow last pipe stage
 ```
 
-**Checklist:** Scoped attributes ✓ Single { } for same-span ✓ No unscoped attrs ✓ No >> unless needed ✓
+**Checklist:** Scoped attributes ✓ Single { } for same-span ✓ No >> unless needed ✓ Sampling at pipeline END if used ✓

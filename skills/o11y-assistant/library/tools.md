@@ -39,10 +39,11 @@
 
 | Tool | Required Params | Behavior |
 |------|-----------------|----------|
-| `tempo_get-attribute-names` | `datasourceUid`, `scope` (optional) | Discover available trace attributes |
+| `tempo_docs-traceql` | `datasourceUid`, `name` ("basic"/"aggregates"/"structural"/"metrics") | Self-teach TraceQL syntax — call before constructing unfamiliar query type |
+| `tempo_get-attribute-names` | `datasourceUid`, `scope` (optional: "span"/"resource"/"event") | Discover available trace attributes |
 | `tempo_get-attribute-values` | `datasourceUid`, `name` | Discover values. 🔴 `filter-query`: single `{ }`, `&&` only (no `\|\|`). |
 | `tempo_traceql-search` | `datasourceUid`, `query`, `start`, `end`, `limit` | **Search queries** (find traces). ❌ SEARCH FILTERS ONLY (no aggregations). |
-| `tempo_traceql-metrics-instant` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** (count, rate, quantile, avg). Single value. |
+| `tempo_traceql-metrics-instant` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** (count, rate, quantile, avg, compare). Single value. |
 | `tempo_traceql-metrics-range` | `datasourceUid`, `query`, `start`, `end` | **Metrics queries** with time-series output. |
 | `tempo_get-trace` | `datasourceUid`, `trace_id` | Retrieve full trace by ID |
 
@@ -51,9 +52,53 @@
 | Type | Keywords | Use Tool |
 |------|----------|----------|
 | **Search** | `{ }` filter, no aggregation | `tempo_traceql-search` |
-| **Metrics** | `count()`, `rate()`, `quantile()`, `avg()` | `tempo_traceql-metrics-instant` or `-range` |
+| **Metrics** | `count()`, `rate()`, `quantile()`, `avg_over_time()` | `tempo_traceql-metrics-instant` or `-range` |
+| **Compare** | `\| compare({condition})` — diff errors vs success, v1 vs v2 | `tempo_traceql-metrics-instant` or `-search` |
 
-**Tempo:** Identify search vs metrics query type. Latency: `duration > 500ms`. Errors: `status = error`. For large datasets: use metrics aggregations instead of search.
+**Structural operators** (use `with(trace_sample=0.1)` when any are present):
+
+| Op | Returns | Typical use |
+|----|---------|------------|
+| `>>` | Descendants | Find all downstream calls |
+| `<<` | Ancestors | Find all upstream callers |
+| `>` / `<` | Direct child / parent | Immediate dependency only |
+| `~` | Siblings | N+1 / parallel operation detection |
+| `!<` | No parent error | Find cascade root cause (origin error) |
+| `&>>` | Full downstream path including self | Complete error cascade |
+
+---
+
+**Sampling — append at END of pipeline (MANDATORY for large datasets):**
+
+| When | Method | Syntax |
+|------|--------|--------|
+| Default: unknown volume / window >15 min | `with(sample=true)` | `{ } \| rate() with(sample=true)` |
+| Any structural operator present (`>>`, `<<`, `~`) | `with(trace_sample=0.1)` | `{ } >> { } \| rate() with(trace_sample=0.1)` |
+| Exact control, data characteristics known | `with(span_sample=0.1)` | `{ } \| rate() with(span_sample=0.1)` |
+
+Always for 7-day+ windows. Never mix methods in one query.
+
+```
+🔴 { selector } with(sample=true) | rate()   ← WRONG (sampling before pipeline end)
+✅ { selector } | rate() with(sample=true)   ← CORRECT (at pipeline END)
+```
+
+---
+
+**Traces as high-cardinality discovery** — use before falling back to multiple metric queries.
+
+Traces carry endpoint, version, status code, downstream service, DB statement — attributes Prometheus never has. One sampling query often replaces 3–5 Prometheus queries + manual correlation.
+
+| Diagnostic question | Query pattern |
+|---------------------|--------------|
+| Which endpoint is slow/erroring? | `{ svc } \| rate() by (span.http.target, span:status) with(sample=true)` |
+| Which version regressed? | `{ svc } \| compare({resource.service.version="v2"})` |
+| Which downstream causes errors? | `{ svc && span:status=error } >> { } \| rate() by (resource.service.name) with(trace_sample=0.1)` |
+| What differs between errors and successes? | `{ svc } \| compare({span:status=error})` |
+| N+1 / parallel DB calls? | `{ span.db.system!=nil } ~ { span.db.system!=nil }` |
+| Cascade root cause (origin error)? | `{ span:status=error } !< { span:status=error }` |
+
+Use `\| topk(N)` to limit high-cardinality groupings. Use `trace:rootService="X"` (indexed) instead of `resource.service.name="X" && span:kind=server` (slower).
 
 ---
 

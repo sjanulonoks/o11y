@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.65.1
+version: 0.66
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
