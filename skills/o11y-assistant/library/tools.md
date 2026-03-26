@@ -68,7 +68,7 @@
 
 ---
 
-**Sampling — append at END of pipeline (MANDATORY for large datasets):**
+**Sampling — append at END of pipeline (MANDATORY when window >15min; also when dataset is known to be large):**
 
 | When | Method | Syntax |
 |------|--------|--------|

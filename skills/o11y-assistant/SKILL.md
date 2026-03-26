@@ -1,6 +1,6 @@
 ---
 name: o11y-assistant
-version: 0.66.1
+version: 0.67
 description: >
   ALWAYS USE when investigating incidents, checking system health, exploring services,
   validating hypotheses, or querying ANY observability backend (Prometheus/Mimir,
@@ -307,6 +307,8 @@ Maintain both tables across all investigation steps. Update after EVERY backend 
 | **COMPARISON** | "difference", "vs" | Two instant queries | Two instant queries | Two instant queries |
 | **TREND** | "over time" | Range query | Range query | Range query |
 
+† **Tempo — window guard:** Add `with(sample=true)` to ALL Tempo queries when window >15min. Add `with(trace_sample=0.1)` instead when structural operators (`>>`, `<<`, `~`) are present. `with(...)` goes at END of pipeline.
+
 ### Epistemic Tension (Classify Before Querying)
 
 *   **Known-Knowns (KK) — The Symptom Bound:** What is explicitly measured (the "What"). *Goal: Establish the factual perimeter of the incident without inferring causality.*
@@ -322,8 +324,9 @@ Backend: [Prometheus/Loki/Tempo]
 User intent: [COUNT/RATE/DISTRIBUTION/etc]
 Query type: [Instant / Range]
 Function: [specific function]
+Sampling: [N/A — non-Tempo backend | N/A — window ≤15min | with(sample=true) — window >15min | with(trace_sample=0.1) — structural op (>>,<<,~)]
 Anti-pattern check: ❌ NOT using [wrong approach] because [reason]
-Budget: [N/ceiling] analytical queries used   ← increment Session State Budget after this query
+Budget: [N/ceiling]
 ```
 
 ---
